@@ -1,1215 +1,1155 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, doc, setDoc, onSnapshot } from 'firebase/firestore';
+<!DOCTYPE html>
+<html lang="th" class="h-full">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>คำนวณเงินเดือน & โอที</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            transition: background-color 0.3s, color 0.3s;
+        }
+        .scroll-container {
+            max-height: calc(100vh - 100px); /* Adjust height based on header height */
+            overflow-y: auto;
+            -ms-overflow-style: none; /* IE and Edge */
+            scrollbar-width: none; /* Firefox */
+        }
+        .scroll-container::-webkit-scrollbar {
+            display: none; /* Chrome, Safari, Opera */
+        }
+        /* Custom styles for loading spinner */
+        .loader {
+            border-top-color: #3b82f6;
+            -webkit-animation: spinner 1.5s linear infinite;
+            animation: spinner 1.5s linear infinite;
+        }
+        @-webkit-keyframes spinner {
+            0% { -webkit-transform: rotate(0deg); }
+            100% { -webkit-transform: rotate(360deg); }
+        }
+        @keyframes spinner {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="h-full bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100 antialiased">
 
-// กำหนดค่า Firebase และ App ID จากตัวแปร Global
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'salary-ot-calculator-app';
-const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config || '{}') : {};
-const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+    <div id="app" class="flex flex-col h-full max-w-4xl mx-auto shadow-xl dark:shadow-none bg-white dark:bg-gray-800 rounded-xl overflow-hidden md:my-4">
+        <header id="app-header"></header>
+        <main id="page-content" class="flex-grow scroll-container p-4 md:p-6"></main>
+        <footer id="app-footer" class="p-2 border-t border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800"></footer>
+    </div>
 
-// --- GEMINI API Configuration ---
-const GEMINI_MODEL = 'gemini-2.5-flash-preview-05-20';
-const API_KEY = "" // API key is provided by the canvas environment
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, setPersistence, browserLocalPersistence } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
-/**
- * Executes a text generation call to the Gemini API with retry logic and Google Search grounding.
- * @param {string} prompt The user prompt to send to the model.
- * @param {string} systemPrompt The system instruction to guide the model's behavior.
- * @returns {Promise<{text: string, sources: Array<{uri: string, title: string}>}>}
- */
-const runLLMGeneration = async (prompt, systemPrompt) => {
-    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${API_KEY}`;
-    
-    const payload = {
-        contents: [{ parts: [{ text: prompt }] }],
-        tools: [{ "google_search": {} }], 
-        systemInstruction: {
-            parts: [{ text: systemPrompt }]
-        },
-    };
+        // --- GLOBAL CONFIG & STATE ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'salary-ot-calculator-app';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config || '{}') : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        
+        // Gemini API Config
+        const GEMINI_MODEL = 'gemini-2.5-flash-preview-05-20';
+        const API_KEY = "" // API key is provided by the canvas environment
 
-    let result = null;
-    let attempts = 0;
-    const maxAttempts = 3;
+        const DOC_ID = 'main_record';
+        const COLLECTION_NAME = 'salary_records';
 
-    while (attempts < maxAttempts) {
-        attempts++;
-        try {
-            const response = await fetch(apiUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
+        // Global State Management
+        const state = {
+            page: 'entry',
+            theme: 'light',
+            baseSalary: 0,
+            otRecords: [],
+            newOtDate: new Date().toISOString().substring(0, 10),
+            newOtHours: '',
+            selectedMonthYear: new Date().toISOString().substring(0, 7),
+            editingRecordId: null,
+            editedDate: '',
+            editedHours: '',
+            db: null,
+            auth: null,
+            userId: null,
+            loading: true, // App init loading (Firebase Auth)
+            dataLoading: false, // Firestore data loading/saving
+            error: '',
+            salarySaveStatus: 'idle',
+            negotiationScript: '',
+            isScriptLoading: false,
+            otAdvice: '',
+            isAdviceLoading: false,
+        };
+
+        // --- UTILITY FUNCTIONS ---
+        
+        // Theme initialization
+        const getInitialTheme = () => {
+            if (typeof localStorage !== 'undefined' && localStorage.getItem('theme')) {
+                return localStorage.getItem('theme');
+            }
+            if (typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+                return 'dark';
+            }
+            return 'light';
+        };
+
+        state.theme = getInitialTheme();
+
+        const updateTheme = () => {
+            localStorage.setItem('theme', state.theme);
+            const html = document.documentElement;
+            if (state.theme === 'dark') {
+                html.classList.add('dark');
+            } else {
+                html.classList.remove('dark');
+            }
+        };
+        updateTheme(); // Apply initial theme
+
+        const getWeekNumber = (d) => {
+            const date = new Date(d);
+            date.setDate(date.getDate() + 4 - (date.getDay() || 7));
+            const yearStart = new Date(date.getFullYear(), 0, 1);
+            const weekNo = Math.ceil((((date - yearStart) / 86400000) + 1) / 7);
+            return date.getFullYear() * 100 + weekNo;
+        };
+
+        const getOtMultiplier = (dateString) => {
+            if (!dateString) return 1.5;
+            const date = new Date(dateString);
+            const dayOfWeek = date.getDay();
+            
+            // 0 is Sunday (Rest Day) -> Effective 3.0x base hourly pay
+            if (dayOfWeek === 0) { 
+                return 3.0;
+            }
+            // Normal Working Day OT
+            return 1.5;
+        };
+
+        const formatMoney = (amount) => {
+            return (amount || 0).toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        };
+
+        const dateToThai = (dateString) => {
+            if (!dateString) return 'N/A';
+            const date = new Date(dateString);
+            // Add 543 to the year for Buddhist calendar
+            const year = date.getFullYear() + 543;
+            
+            const dayNames = ['อาทิตย์', 'จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์', 'เสาร์'];
+            const monthNames = [
+                'ม.ค.', 'ก.พ.', 'มี.ค.', 'เม.ย.', 'พ.ค.', 'มิ.ย.', 
+                'ก.ค.', 'ส.ค.', 'ก.ย.', 'ต.ค.', 'พ.ย.', 'ธ.ค.'
+            ];
+
+            const dayOfWeek = date.getDay();
+            const day = date.getDate();
+            const month = date.getMonth();
+            
+            return `${day} ${monthNames[month]} ${year} (${dayNames[dayOfWeek]})`;
+        }
+        
+        const monthYearToThai = (monthYearString) => {
+            if (!monthYearString) return 'N/A';
+            const [year, month] = monthYearString.split('-').map(Number);
+            const date = new Date(year, month - 1, 1);
+            
+            // Add 543 to the year for Buddhist calendar
+            const buddhistYear = date.getFullYear() + 543;
+            
+            const monthName = date.toLocaleDateString('th-TH', { month: 'long' });
+            return `${monthName} ${buddhistYear}`;
+        }
+
+        // --- ICON SVGs (Converted from React Components) ---
+        const EntryIcon = (className = "w-4 h-4") => `<svg xmlns="http://www.w3.org/2000/svg" class="${className}" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9" /><path d="M16.5 3.5l4 4L7.5 20.5 4 20l.5-3.5 12-12z" /></svg>`;
+        const DashboardIcon = (className = "w-4 h-4") => `<svg xmlns="http://www.w3.org/2000/svg" class="${className}" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="9" x="3" y="3" rx="1" /><rect width="7" height="5" x="14" y="3" rx="1" /><rect width="7" height="9" x="14" y="12" rx="1" /><rect width="7" height="5" x="3" y="16" rx="1" /></svg>`;
+        const WalletIcon = (className = "w-6 h-6") => `<svg xmlns="http://www.w3.org/2000/svg" class="${className}" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 7V4a1 1 0 0 0-1-1H5a2 2 0 0 0 0 4h15a1 1 0 0 1 1 1v4a2 2 0 0 1-2 2h-6m-2 2a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2v-4a2 2 0 0 0-2-2h-2a2 2 0 0 0-2 2v4z" /><path d="M18 10h.01"/></svg>`;
+        const TimerIcon = (className = "w-6 h-6") => `<svg xmlns="http://www.w3.org/2000/svg" class="${className}" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="10" x2="14" y1="2" y2="2" /><line x1="12" x2="12" y1="14" y2="10" /><circle cx="12" cy="12" r="10" /></svg>`;
+        const ClockIcon = (className = "w-6 h-6") => `<svg xmlns="http://www.w3.org/2000/svg" class="${className}" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10" /><polyline points="12 6 12 12 16 14" /></svg>`;
+        const TrendingUpIcon = (className = "w-6 h-6") => `<svg xmlns="http://www.w3.org/2000/svg" class="${className}" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 7 18 11 13 6 9 10 2 3" /><polyline points="18 7 22 7 22 11" /></svg>`;
+        const CalendarDaysIcon = (className = "w-6 h-6") => `<svg xmlns="http://www.w3.org/2000/svg" class="${className}" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2" ry="2" /><line x1="16" x2="16" y1="2" y2="6" /><line x1="8" x2="8" y1="2" y2="6" /><line x1="3" x2="21" y1="10" y2="10" /><path d="M8 14h.01" /><path d="M12 14h.01" /><path d="M16 14h.01" /><path d="M8 18h.01" /><path d="M12 18h.01" /><path d="M16 18h.01" /></svg>`;
+        const BarChart3Icon = (className = "w-6 h-6") => `<svg xmlns="http://www.w3.org/2000/svg" class="${className}" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18" /><path d="M18 17V9" /><path d="M13 17V5" /><path d="M8 17v-3" /></svg>`;
+        const ThemeIcon = (isDark, className = "w-6 h-6") => `
+            <svg xmlns="http://www.w3.org/2000/svg" class="${className}" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                ${isDark ? 
+                    '<path d="M12 2v1m0 18v1m9-9h-1M3 12H2m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707m-1.768-1.768a4 4 0 11-8 0 4 4 0 018 0z" />' : 
+                    '<path d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />'}
+            </svg>`;
+        const NegotiationIcon = (className = "w-6 h-6") => `<svg xmlns="http://www.w3.org/2000/svg" class="${className}" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="7" rx="2" ry="2" /><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16" /></svg>`;
+        const LightbulbIcon = (className = "w-6 h-6") => `<svg xmlns="http://www.w3.org/2000/svg" class="${className}" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 14c.2-.8.8-1.7 1.4-2.3.8-.8 1.6-1.5 1.6-2.7 0-1.8-1.5-3-3.2-3.2h-.1c-1.8 0-3 1.5-3.2 3.2 0 1.2.8 1.9 1.6 2.7.6.6 1.2 1.5 1.4 2.3"/><path d="M9 13v.1"/><path d="M12 13v.1"/><path d="M15 13v.1"/><path d="M12 22a4 4 0 0 1-4-4h8a4 4 0 0 1-4-4z"/></svg>`;
+        const EditIcon = (className = "w-4 h-4") => `<svg xmlns="http://www.w3.org/2000/svg" class="${className}" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" /></svg>`;
+        const TrashIcon = (className = "w-4 h-4") => `<svg xmlns="http://www.w3.org/2000/svg" class="${className}" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18" /><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" /><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" /><line x1="10" x2="10" y1="11" y2="17" /><line x1="14" x2="14" y1="11" y2="17" /></svg>`;
+        const SaveIcon = (className = "w-4 h-4") => `<svg xmlns="http://www.w3.org/2000/svg" class="${className}" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" /><polyline points="17 21 17 13 7 13 7 21" /><polyline points="7 3 7 8 15 8" /></svg>`;
+        const XIcon = (className = "w-4 h-4") => `<svg xmlns="http://www.w3.org/2000/svg" class="${className}" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18" /><path d="M6 6l12 12" /></svg>`;
+        const Spinner = (className = "w-6 h-6") => `<div class="${className} border-4 border-gray-200 border-t-4 border-t-sky-500 rounded-full animate-spin"></div>`;
+
+
+        // --- FIREBASE AND DATA MANAGEMENT ---
+
+        /**
+         * Saves the current state of salary and OT records to Firestore.
+         */
+        const saveToFirestore = async (newSalary, newRecords, context = 'ot') => {
+            if (!state.db || !state.userId) {
+                console.error("Database is not ready.");
+                setState({ error: "ฐานข้อมูลยังไม่พร้อมใช้งาน" });
+                return;
+            }
+
+            const docPath = `/artifacts/${appId}/users/${state.userId}/${COLLECTION_NAME}/${DOC_ID}`;
+            const docRef = doc(state.db, docPath);
+
+            if (context === 'salary') setState({ salarySaveStatus: 'pending' });
+            
+            try {
+                // Ensure newRecords is sorted by date ascending
+                const sortedRecords = newRecords.sort((a, b) => new Date(a.date) - new Date(b.date) || a.id.localeCompare(b.id));
+
+                await setDoc(docRef, {
+                    baseSalary: newSalary,
+                    otRecords: sortedRecords,
+                    updatedAt: new Date().toISOString()
+                }, { merge: true });
+                
+                // State will be updated by the onSnapshot listener, but we update status immediately for better UX
+                if (context === 'salary') {
+                    setState({ salarySaveStatus: 'success' });
+                    setTimeout(() => setState({ salarySaveStatus: 'idle' }), 3000);
+                }
+            } catch (e) {
+                console.error("Error saving data:", e);
+                setState({ error: "เกิดข้อผิดพลาดในการบันทึกข้อมูล: " + e.message });
+                if (context === 'salary') setState({ salarySaveStatus: 'error' });
+            }
+        };
+
+        /**
+         * Initializes Firebase and sets up authentication and real-time data listener.
+         */
+        const initApp = async () => {
+            try {
+                setLogLevel('error');
+                const firebaseApp = initializeApp(firebaseConfig);
+                const firestoreDb = getFirestore(firebaseApp);
+                const firebaseAuth = getAuth(firebaseApp);
+                
+                setState({ db: firestoreDb, auth: firebaseAuth });
+                
+                await setPersistence(firebaseAuth, browserLocalPersistence);
+
+                const unsubscribeAuth = onAuthStateChanged(firebaseAuth, async (user) => {
+                    if (user) {
+                        setState({ userId: user.uid, loading: false });
+                        setupDataListener(firestoreDb, user.uid);
+                    } else {
+                        if (!initialAuthToken) {
+                            await signInAnonymously(firebaseAuth);
+                        }
+                    }
+                });
+
+                if (initialAuthToken) {
+                    await signInWithCustomToken(firebaseAuth, initialAuthToken)
+                        .catch(e => {
+                            console.error("Error signing in with custom token:", e);
+                            setState({ error: "เกิดข้อผิดพลาดในการลงชื่อเข้าใช้: " + e.message, loading: false });
+                        });
+                }
+                
+                // Cleanup function is not strictly needed here as this is a single-page app initiation
+                // return () => unsubscribeAuth(); 
+
+            } catch (e) {
+                console.error("Firebase Initialization Error:", e);
+                setState({ error: "เกิดข้อผิดพลาดในการเริ่มต้น Firebase: " + e.message, loading: false });
+            }
+        };
+
+        /**
+         * Sets up the real-time listener for the user's data.
+         */
+        const setupDataListener = (db, userId) => {
+            const docPath = `/artifacts/${appId}/users/${userId}/${COLLECTION_NAME}/${DOC_ID}`;
+            const docRef = doc(db, docPath);
+            
+            setState({ dataLoading: true });
+
+            onSnapshot(docRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    const data = docSnap.data();
+                    setState({
+                        baseSalary: data.baseSalary || 0,
+                        otRecords: data.otRecords || [],
+                        error: '',
+                        dataLoading: false
+                    });
+                } else {
+                    console.log("No data found, initializing a new record.");
+                    setState({ baseSalary: 0, otRecords: [], dataLoading: false });
+                }
+            }, (e) => {
+                console.error("Firestore Snapshot Error:", e);
+                setState({ error: "เกิดข้อผิดพลาดในการดึงข้อมูล: " + e.message, dataLoading: false });
             });
+        };
 
-            if (!response.ok) {
-                if (response.status === 429 && attempts < maxAttempts) {
+
+        // --- GEMINI API CALLS ---
+
+        /**
+         * Executes a text generation call to the Gemini API with retry logic and Google Search grounding.
+         */
+        const runLLMGeneration = async (prompt, systemPrompt) => {
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${API_KEY}`;
+            
+            const payload = {
+                contents: [{ parts: [{ text: prompt }] }],
+                tools: [{ "google_search": {} }], 
+                systemInstruction: {
+                    parts: [{ text: systemPrompt }]
+                },
+            };
+
+            let result = null;
+            let attempts = 0;
+            const maxAttempts = 3;
+
+            while (attempts < maxAttempts) {
+                attempts++;
+                try {
+                    const response = await fetch(apiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (!response.ok) {
+                        if (response.status === 429 && attempts < maxAttempts) {
+                            const delay = Math.pow(2, attempts) * 1000;
+                            await new Promise(resolve => setTimeout(resolve, delay));
+                            continue; 
+                        }
+                        const errorBody = await response.text();
+                        throw new Error(`API call failed with status ${response.status}: ${errorBody}`);
+                    }
+
+                    const jsonResponse = await response.json();
+                    const candidate = jsonResponse.candidates?.[0];
+
+                    if (candidate && candidate.content?.parts?.[0]?.text) {
+                        const text = candidate.content.parts[0].text;
+                        
+                        let sources = [];
+                        const groundingMetadata = candidate.groundingMetadata;
+                        if (groundingMetadata && groundingMetadata.groundingAttributions) {
+                            sources = groundingMetadata.groundingAttributions
+                                .map(attribution => ({
+                                    uri: attribution.web?.uri,
+                                    title: attribution.web?.title,
+                                }))
+                                .filter(source => source.uri && source.title);
+                        }
+
+                        result = { text, sources };
+                        break; // Success
+                    } else {
+                        throw new Error("Invalid response structure or missing text content from Gemini API.");
+                    }
+                } catch (e) {
+                    console.error(`Attempt ${attempts} failed:`, e.message);
+                    if (attempts === maxAttempts) {
+                        throw new Error(`Failed to generate content after ${maxAttempts} attempts.`);
+                    }
                     const delay = Math.pow(2, attempts) * 1000;
                     await new Promise(resolve => setTimeout(resolve, delay));
-                    continue; 
                 }
-                const errorBody = await response.text();
-                throw new Error(`API call failed with status ${response.status}: ${errorBody}`);
             }
-
-            const jsonResponse = await response.json();
-            const candidate = jsonResponse.candidates?.[0];
-
-            if (candidate && candidate.content?.parts?.[0]?.text) {
-                const text = candidate.content.parts[0].text;
-                
-                let sources = [];
-                const groundingMetadata = candidate.groundingMetadata;
-                if (groundingMetadata && groundingMetadata.groundingAttributions) {
-                    sources = groundingMetadata.groundingAttributions
-                        .map(attribution => ({
-                            uri: attribution.web?.uri,
-                            title: attribution.web?.title,
-                        }))
-                        .filter(source => source.uri && source.title);
-                }
-
-                result = { text, sources };
-                break; // Success
-            } else {
-                throw new Error("Invalid response structure or missing text content from Gemini API.");
-            }
-        } catch (e) {
-            console.error(`Attempt ${attempts} failed:`, e.message);
-            if (attempts === maxAttempts) {
-                throw new Error(`Failed to generate content after ${maxAttempts} attempts.`);
-            }
-            const delay = Math.pow(2, attempts) * 1000;
-            await new Promise(resolve => setTimeout(resolve, delay));
-        }
-    }
-    return result;
-};
+            return result;
+        };
 
 
-// Utility function to get the week number of the year for grouping
-const getWeekNumber = (d) => {
-    const date = new Date(d);
-    date.setDate(date.getDate() + 4 - (date.getDay() || 7));
-    const yearStart = new Date(date.getFullYear(), 0, 1);
-    const weekNo = Math.ceil((((date - yearStart) / 86400000) + 1) / 7);
-    return date.getFullYear() * 100 + weekNo; // Unique year-week key
-};
+        // --- CORE CALCULATION LOGIC (Memoized logic converted to function) ---
 
-// Utility function to get the effective pay multiplier based on day of week
-const getOtMultiplier = (dateString) => {
-    // 0 is Sunday, 6 is Saturday
-    if (!dateString) return 1.5;
-    const date = new Date(dateString);
-    const dayOfWeek = date.getDay(); 
-    
-    // กฎใหม่: วันอาทิตย์ (Rest Day) ได้ 2 แรง (2x ชั่วโมง)
-    // ถ้า base OT คือ 1.5x, การได้ 2x ชั่วโมง (4ชม. = 8ชม.) ที่ rate 1.5x 
-    // เท่ากับได้ 2 * 1.5 = 3.0x base hourly pay
-    
-    if (dayOfWeek === 0) { // Sunday (วันอาทิตย์)
-        return 3.0; // Effective 3.0x base hourly pay
-    }
-    
-    // วันทำงานปกติ (Working Day OT)
-    return 1.5; 
-};
-
-
-// --- MODERN SVG ICONS ---
-const EntryIcon = ({ className = "w-5 h-5" }) => (
-    <svg xmlns="http://www.w3.org/2000/svg" className={className} width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9" /><path d="M16.5 3.5l4 4L7.5 20.5 4 20l.5-3.5 12-12z" /></svg>
-);
-const DashboardIcon = ({ className = "w-5 h-5" }) => (
-    <svg xmlns="http://www.w3.org/2000/svg" className={className} width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><rect width="7" height="9" x="3" y="3" rx="1" /><rect width="7" height="5" x="14" y="3" rx="1" /><rect width="7" height="9" x="14" y="12" rx="1" /><rect width="7" height="5" x="3" y="16" rx="1" /></svg>
-);
-const WalletIcon = ({ className = "w-6 h-6" }) => (
-    <svg xmlns="http://www.w3.org/2000/svg" className={className} width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M19 7V4a1 1 0 0 0-1-1H5a2 2 0 0 0 0 4h15a1 1 0 0 1 1 1v4a2 2 0 0 1-2 2h-6m-2 2a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2v-4a2 2 0 0 0-2-2h-2a2 2 0 0 0-2 2v4z" /><path d="M18 10h.01"/></svg>
-);
-const TimerIcon = ({ className = "w-6 h-6" }) => (
-    <svg xmlns="http://www.w3.org/2000/svg" className={className} width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="10" x2="14" y1="2" y2="2" /><line x1="12" x2="12" y1="14" y2="10" /><circle cx="12" cy="12" r="10" /></svg>
-);
-const ClockIcon = ({ className = "w-6 h-6" }) => (
-    <svg xmlns="http://www.w3.org/2000/svg" className={className} width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><polyline points="12 6 12 12 16 14" /></svg>
-);
-const TrendingUpIcon = ({ className = "w-6 h-6" }) => (
-    <svg xmlns="http://www.w3.org/2000/svg" className={className} width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="22 7 18 11 13 6 9 10 2 3" /><polyline points="18 7 22 7 22 11" /></svg>
-);
-const CalendarDaysIcon = ({ className = "w-6 h-6" }) => (
-    <svg xmlns="http://www.w3.org/2000/svg" className={className} width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="18" height="18" x="3" y="4" rx="2" ry="2" /><line x1="16" x2="16" y1="2" y2="6" /><line x1="8" x2="8" y1="2" y2="6" /><line x1="3" x2="21" y1="10" y2="10" /><path d="M8 14h.01" /><path d="M12 14h.01" /><path d="M16 14h.01" /><path d="M8 18h.01" /><path d="M12 18h.01" /><path d="M16 18h.01" /></svg>
-);
-const BarChart3Icon = ({ className = "w-6 h-6" }) => (
-    <svg xmlns="http://www.w3.org/2000/svg" className={className} width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3v18h18" /><path d="M18 17V9" /><path d="M13 17V5" /><path d="M8 17v-3" /></svg>
-);
-const ThemeIcon = ({ isDark, className = "w-6 h-6" }) => (
-    <svg xmlns="http://www.w3.org/2000/svg" className={className} width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-        {isDark ? (
-            <path d="M12 2v1m0 18v1m9-9h-1M3 12H2m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707m-1.768-1.768a4 4 0 11-8 0 4 4 0 018 0z" />
-        ) : (
-            <path d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
-        )}
-    </svg>
-);
-const NegotiationIcon = ({ className = "w-6 h-6" }) => (
-    <svg xmlns="http://www.w3.org/2000/svg" className={className} width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="20" height="14" x="2" y="7" rx="2" ry="2" /><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16" /></svg>
-);
-const LightbulbIcon = ({ className = "w-6 h-6" }) => (
-    <svg xmlns="http://www.w3.org/2000/svg" className={className} width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M15 14c.2-.8.8-1.7 1.4-2.3.8-.8 1.6-1.5 1.6-2.7 0-1.8-1.5-3-3.2-3.2h-.1c-1.8 0-3 1.5-3.2 3.2 0 1.2.8 1.9 1.6 2.7.6.6 1.2 1.5 1.4 2.3"/><path d="M9 13v.1"/><path d="M12 13v.1"/><path d="M15 13v.1"/><path d="M12 22a4 4 0 0 1-4-4h8a4 4 0 0 1-4-4z"/></svg>
-);
-const EditIcon = ({ className = "w-4 h-4" }) => (
-    <svg xmlns="http://www.w3.org/2000/svg" className={className} width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" /></svg>
-);
-const TrashIcon = ({ className = "w-4 h-4" }) => (
-    <svg xmlns="http://www.w3.org/2000/svg" className={className} width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18" /><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" /><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" /><line x1="10" x2="10" y1="11" y2="17" /><line x1="14" x2="14" y1="11" y2="17" /></svg>
-);
-const SaveIcon = ({ className = "w-4 h-4" }) => (
-    <svg xmlns="http://www.w3.org/2000/svg" className={className} width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" /><polyline points="17 21 17 13 7 13 7 21" /><polyline points="7 3 7 8 15 8" /></svg>
-);
-const XIcon = ({ className = "w-4 h-4" }) => (
-    <svg xmlns="http://www.w3.org/2000/svg" className={className} width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6L6 18" /><path d="M6 6l12 12" /></svg>
-);
-
-
-// --- MAIN REACT COMPONENT ---
-
-const getInitialTheme = () => {
-    if (typeof window !== 'undefined' && localStorage.getItem('theme')) {
-        return localStorage.getItem('theme');
-    }
-    if (typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches) {
-        return 'dark';
-    }
-    return 'light';
-};
-
-const App = () => {
-    const [page, setPage] = useState('entry');
-    const [theme, setTheme] = useState(getInitialTheme);
-    const [baseSalary, setBaseSalary] = useState(0);
-    const [otRecords, setOtRecords] = useState([]);
-    const [newOtDate, setNewOtDate] = useState(new Date().toISOString().substring(0, 10));
-    const [newOtHours, setNewOtHours] = useState('');
-    const [selectedMonthYear, setSelectedMonthYear] = useState(new Date().toISOString().substring(0, 7));
-
-    // --- EDITING STATES ---
-    const [editingRecordId, setEditingRecordId] = useState(null);
-    const [editedDate, setEditedDate] = useState('');
-    const [editedHours, setEditedHours] = useState('');
-
-    const [db, setDb] = useState(null);
-    const [auth, setAuth] = useState(null);
-    const [userId, setUserId] = useState(null);
-    const [loading, setLoading] = useState(true);
-    const [dataLoading, setDataLoading] = useState(false);
-    const [error, setError] = useState('');
-    const [salarySaveStatus, setSalarySaveStatus] = useState('idle');
-
-    // --- GEMINI STATES ---
-    const [negotiationScript, setNegotiationScript] = useState('');
-    const [isScriptLoading, setIsScriptLoading] = useState(false);
-    const [otAdvice, setOtAdvice] = useState('');
-    const [isAdviceLoading, setIsAdviceLoading] = useState(false);
-    // -------------------------
-
-    const DOC_ID = 'main_record';
-    const COLLECTION_NAME = 'salary_records';
-
-    const toggleTheme = () => {
-        setTheme(prevTheme => prevTheme === 'light' ? 'dark' : 'light');
-    };
-
-    // 0. Theme Persistence Effect
-    useEffect(() => {
-        localStorage.setItem('theme', theme);
-        const html = document.documentElement;
-        if (theme === 'dark') {
-            html.classList.add('dark');
-        } else {
-            html.classList.remove('dark');
-        }
-    }, [theme]);
-
-    // 1. FIREBASE INITIALIZATION & AUTHENTICATION
-    useEffect(() => {
-        try {
-            const firebaseApp = initializeApp(firebaseConfig);
-            const firestoreDb = getFirestore(firebaseApp);
-            const firebaseAuth = getAuth(firebaseApp);
+        /**
+         * Performs all required calculations based on the current state.
+         * @returns {object} The calculated data object.
+         */
+        const calculateData = () => {
+            const baseSalary = state.baseSalary;
             
-            setDb(firestoreDb);
-            setAuth(firebaseAuth);
+            // Assume 20 working days/month * 8 hours/day = 160 hours
+            const hourlyRate = baseSalary > 0 ? baseSalary / 160 : 0;
+            
+            // Define standard 1.5x rate for reference
+            const otRate1_5x = hourlyRate * 1.5; 
 
-            const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
-                if (user) {
-                    setUserId(user.uid); 
-                    setLoading(false);
-                } else {
-                    if (!initialAuthToken) {
-                        await signInAnonymously(firebaseAuth);
+            // Filter for records in the SELECTED month for Dashboard calculations
+            const monthlyOtRecords = state.otRecords.filter(record => 
+                record.date.startsWith(state.selectedMonthYear)
+            );
+
+            let totalOtHours = 0; // Actual hours worked
+            let totalOtPay = 0;
+            let totalEffectiveOtHours = 0; // Hours calculated for dashboard summary (equivalent hours at 1.5x rate)
+
+            const weeklySummary = {};
+            let period1Pay = 0; // 1st to 15th
+            let period2Pay = 0; // 16th to end of month
+            
+            const calculatedRecords = []; // Array to store records with calculated fields
+
+            monthlyOtRecords.forEach(record => {
+                const payMultiplier = getOtMultiplier(record.date); // 1.5 or 3.0
+                const effectiveOtRate = hourlyRate * payMultiplier;
+                
+                const otPay = record.otHours * effectiveOtRate;
+                
+                // Effective hours calculation: actualHours * (payMultiplier / 1.5)
+                const effectiveHours = record.otHours * (payMultiplier / 1.5);
+                
+                totalOtHours += record.otHours; // Actual hours
+                totalEffectiveOtHours += effectiveHours; // Effective hours 
+                totalOtPay += otPay;
+
+                // Store calculated fields for UI rendering
+                calculatedRecords.push({
+                    ...record,
+                    effectiveOtRate,
+                    payMultiplier,
+                    effectiveHours,
+                    otPay
+                });
+
+                const date = new Date(record.date);
+                const dateDay = date.getDate();
+                const weekKey = getWeekNumber(date);
+
+                if (!weeklySummary[weekKey]) {
+                    weeklySummary[weekKey] = { 
+                        weekKey, 
+                        records: [], 
+                        totalHours: 0, 
+                        totalPay: 0, 
+                        startDate: date, 
+                        endDate: date,
+                        totalEffectiveHours: 0
+                    };
+                }
+                // Update weekly summary with calculated values
+                weeklySummary[weekKey].records.push({...record, effectiveOtRate, payMultiplier, effectiveHours});
+                weeklySummary[weekKey].totalHours += record.otHours;
+                weeklySummary[weekKey].totalEffectiveHours += effectiveHours;
+                weeklySummary[weekKey].totalPay += otPay;
+
+                if (date < weeklySummary[weekKey].startDate) {
+                    weeklySummary[weekKey].startDate = date;
+                }
+                if (date > weeklySummary[weekKey].endDate) {
+                    weeklySummary[weekKey].endDate = date;
+                }
+
+                // Calculate pay periods
+                if (dateDay >= 1 && dateDay <= 15) {
+                    period1Pay += otPay;
+                } else if (dateDay >= 16) {
+                    period2Pay += otPay;
+                }
+            });
+
+            const sortedWeeklySummary = Object.values(weeklySummary).sort((a, b) => {
+                return a.weekKey - b.weekKey;
+            });
+            
+            // Calculate dynamic dates for the selected month
+            const [year, month] = state.selectedMonthYear.split('-').map(Number);
+            
+            const selectedDate = new Date(year, month - 1, 1);
+            
+            // Next month's 7th (for 16th to end of selected month's OT)
+            const nextMonthDate = new Date(year, month, 7);
+            const nextMonth7th = nextMonthDate.toLocaleDateString('th-TH', { day: 'numeric', month: 'long' }) + ' ' + (nextMonthDate.getFullYear() + 543);
+            
+            // Selected month's 22nd (for 1st to 15th of selected month's OT)
+            const currentMonthDate = new Date(year, month - 1, 22);
+            const currentMonth22nd = currentMonthDate.toLocaleDateString('th-TH', { day: 'numeric', month: 'long' }) + ' ' + (currentMonthDate.getFullYear() + 543);
+            
+            // Sort calculated records by date descending (latest first)
+            const sortedCalculatedRecords = calculatedRecords.sort((a, b) => new Date(b.date) - new Date(a.date) || a.id.localeCompare(b.id));
+
+
+            return {
+                baseSalary,
+                hourlyRate,
+                otRate: otRate1_5x, // Standard 1.5x rate for reference
+                totalOtHours, // Actual hours worked
+                totalEffectiveOtHours, // Hours equivalent to standard 1.5x OT
+                totalOtPay,
+                weeklySummary: sortedWeeklySummary,
+                period1Pay,
+                period2Pay,
+                currentMonth22nd,
+                nextMonth7th,
+                calculatedRecords: sortedCalculatedRecords
+            };
+        };
+
+
+        // --- EVENT HANDLERS (Mirroring React Logic) ---
+
+        const handleSalaryChange = (value) => {
+            const salary = parseFloat(value) || 0;
+            setState({ baseSalary: salary, error: '', salarySaveStatus: 'idle' });
+        };
+
+        const handleSaveSalary = () => {
+            saveToFirestore(state.baseSalary, state.otRecords, 'salary');
+        };
+
+        const handleAddRecord = () => {
+            const hours = parseFloat(state.newOtHours);
+            if (state.newOtDate && hours > 0) {
+                const newRecord = {
+                    id: crypto.randomUUID(),
+                    date: state.newOtDate,
+                    otHours: hours,
+                };
+                const updatedRecords = [...state.otRecords, newRecord];
+                
+                // Save records and reset input
+                saveToFirestore(state.baseSalary, updatedRecords);
+                
+                const savedDate = state.newOtDate;
+                setState({ 
+                    newOtHours: '', 
+                    newOtDate: new Date().toISOString().substring(0, 10),
+                    selectedMonthYear: savedDate.substring(0, 7) // Switch to the month of the added record
+                });
+
+            } else {
+                setState({ error: 'กรุณากรอกวันที่และชั่วโมงโอทีให้ถูกต้อง' });
+            }
+        };
+
+        const handleDeleteRecord = (id) => {
+            if (state.editingRecordId === id) {
+                setState({ editingRecordId: null });
+            }
+            const updatedRecords = state.otRecords.filter(record => record.id !== id);
+            saveToFirestore(state.baseSalary, updatedRecords);
+        };
+
+        const handleStartEdit = (record) => {
+            setState({
+                editingRecordId: record.id,
+                editedDate: record.date,
+                editedHours: record.otHours.toString(),
+                error: '',
+            });
+        };
+
+        const handleCancelEdit = () => {
+            setState({
+                editingRecordId: null,
+                editedDate: '',
+                editedHours: '',
+                error: '',
+            });
+        };
+
+        const handleSaveEdit = () => {
+            const hours = parseFloat(state.editedHours);
+            if (state.editedDate && hours > 0) {
+                const updatedRecords = state.otRecords.map(record => 
+                    record.id === state.editingRecordId
+                        ? { ...record, date: state.editedDate, otHours: hours }
+                        : record
+                );
+                
+                saveToFirestore(state.baseSalary, updatedRecords);
+                
+                // Reset editing state and switch to the month of the edited record
+                setState({
+                    editingRecordId: null,
+                    editedDate: '',
+                    editedHours: '',
+                    error: '',
+                    selectedMonthYear: state.editedDate.substring(0, 7)
+                });
+
+            } else {
+                setState({ error: 'กรุณากรอกวันที่และชั่วโมงโอทีให้ถูกต้องสำหรับการแก้ไข' });
+            }
+        };
+
+        // --- LLM Handlers ---
+        const handleGenerateNegotiationScript = async () => {
+            if (state.isScriptLoading) return;
+            
+            const calculationData = calculateData();
+            const { baseSalary, totalEffectiveOtHours, totalOtPay } = calculationData; 
+
+            if (baseSalary <= 0) {
+                setState({ error: 'กรุณาบันทึกเงินเดือนพื้นฐานก่อนใช้ฟีเจอร์นี้' });
+                setTimeout(() => setState({ error: '' }), 5000);
+                return;
+            }
+            
+            if (totalOtPay <= 0) {
+                const monthName = monthYearToThai(state.selectedMonthYear);
+                setState({ error: `ไม่มีข้อมูล OT ในเดือน ${monthName} กรุณาเลือกเดือนที่มีข้อมูล` });
+                setTimeout(() => setState({ error: '' }), 5000);
+                return;
+            }
+
+            setState({ isScriptLoading: true, negotiationScript: '', error: '' });
+
+            const monthName = monthYearToThai(state.selectedMonthYear);
+
+            const prompt = `
+                Draft a professional and persuasive script for a salary review or negotiation meeting.
+                The script should focus on my dedication and workload, supported by the following financial data for the period of ${monthName}:
+                - Current Monthly Base Salary: ${baseSalary.toLocaleString()} THB
+                - Total Overtime Pay logged in ${monthName}: ${totalOtPay.toLocaleString()} THB
+                - Total Overtime Hours (Effective Value at 1.5x rate): ${totalEffectiveOtHours.toFixed(1)} hours
+
+                The script must be in Thai, concise, encouraging, and focused on requesting a review of the base salary based on the consistent workload (evidenced by the OT).
+                Structure the response as a formal, short email or a bulleted speaking script.
+            `;
+
+            const systemPrompt = "You are a world-class HR consultant. Provide a concise, professional, and encouraging script in Thai for a user to request a base salary review, citing their recorded workload and overtime. Use a confident but polite tone.";
+
+            try {
+                const result = await runLLMGeneration(prompt, systemPrompt);
+                setState({ negotiationScript: result.text });
+            } catch (e) {
+                console.error("Gemini API Error:", e);
+                setState({
+                    error: "เกิดข้อผิดพลาดในการสร้างสคริปต์เจรจาเงินเดือน: " + e.message,
+                    negotiationScript: "ไม่สามารถสร้างสคริปต์ได้เนื่องจากข้อผิดพลาด: " + e.message
+                });
+            } finally {
+                setState({ isScriptLoading: false });
+            }
+        };
+
+        const handleGenerateOtAdvice = async () => {
+            if (state.isAdviceLoading) return;
+
+            const calculationData = calculateData();
+            const { baseSalary, totalOtHours, totalOtPay } = calculationData;
+
+            if (totalOtPay <= 0) {
+                const monthName = monthYearToThai(state.selectedMonthYear);
+                setState({ error: `ไม่มีข้อมูล OT ในเดือน ${monthName} กรุณาเลือกเดือนที่มีข้อมูล` });
+                setTimeout(() => setState({ error: '' }), 5000);
+                return;
+            }
+
+            setState({ isAdviceLoading: true, otAdvice: '', error: '' });
+            
+            const monthName = monthYearToThai(state.selectedMonthYear);
+
+            const prompt = `
+                Analyze the user's recent overtime (OT) data in ${monthName}: 
+                Total OT Hours logged (Actual): ${totalOtHours.toFixed(1)} hours, 
+                Total OT Pay: ${totalOtPay.toLocaleString()} THB, 
+                Base Salary: ${baseSalary.toLocaleString()} THB.
+                
+                **Crucial context:** The user's calculation includes a 3.0x rate for Sunday OT (2x hours * 1.5x rate).
+                
+                Provide concise and actionable advice (in Thai) focused on one key area: 
+                Either a strategy for optimizing/maximizing legal OT earnings based on common labor practices (e.g., maximizing weekend or holiday rates) OR a tip for minimizing the need for OT while maintaining productivity (work-life balance advice).
+                
+                Choose the most relevant suggestion based on the context of consistent OT records and the high Sunday multiplier.
+                The response should be 2-3 short, clear paragraphs in Thai.
+            `;
+
+            const systemPrompt = "You are a specialized HR and efficiency analyst providing general advice in Thai on optimizing overtime and work-life balance, grounded in common labor practices and time management principles. Do not provide a script; provide actionable advice.";
+
+            try {
+                const result = await runLLMGeneration(prompt, systemPrompt);
+                setState({ otAdvice: result.text });
+            } catch (e) {
+                console.error("Gemini API Error:", e);
+                setState({
+                    error: "เกิดข้อผิดพลาดในการสร้างคำแนะนำ OT: " + e.message,
+                    otAdvice: "ไม่สามารถสร้างคำแนะนำได้เนื่องจากข้อผิดพลาด: " + e.message
+                });
+            } finally {
+                setState({ isAdviceLoading: false });
+            }
+        };
+
+
+        // --- UI RENDERING FUNCTIONS ---
+        
+        const setState = (newState) => {
+            // Simple state merge and re-render trigger
+            Object.assign(state, newState);
+            renderApp();
+        };
+
+        const getUniqueMonths = () => {
+            const months = new Set();
+            state.otRecords.forEach(record => {
+                months.add(record.date.substring(0, 7)); // YYYY-MM
+            });
+            
+            const currentMonthYear = new Date().toISOString().substring(0, 7);
+            if (!months.has(currentMonthYear)) {
+                months.add(currentMonthYear);
+            }
+            
+            return Array.from(months).sort().reverse();
+        }
+
+        const renderHeader = () => {
+            const headerEl = document.getElementById('app-header');
+            const dataLoading = state.dataLoading || state.loading;
+
+            headerEl.innerHTML = `
+                <div class="flex justify-between items-center p-4 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 sticky top-0 z-10 shadow-md">
+                    <h1 class="text-xl font-extrabold text-sky-700 dark:text-sky-400">คำนวณเงินเดือน & โอที</h1>
+                    <div class="flex space-x-2">
+                        <button id="nav-entry" class="text-sm px-3 py-1.5 rounded-full font-semibold transition duration-200 ${state.page === 'entry' ? 'bg-sky-600 text-white shadow-lg' : 'bg-gray-100 dark:bg-gray-700 text-sky-600 dark:text-sky-400 hover:bg-sky-50 dark:hover:bg-gray-600 hover:text-sky-700'}" ${dataLoading ? 'disabled' : ''}>
+                            ${EntryIcon("w-4 h-4 inline mr-1 -mt-0.5")}
+                            กรอกข้อมูล
+                        </button>
+                        <button id="nav-dashboard" class="text-sm px-3 py-1.5 rounded-full font-semibold transition duration-200 ${state.page === 'dashboard' ? 'bg-sky-600 text-white shadow-lg' : 'bg-gray-100 dark:bg-gray-700 text-sky-600 dark:text-sky-400 hover:bg-sky-50 dark:hover:bg-gray-600 hover:text-sky-700'}" ${dataLoading ? 'disabled' : ''}>
+                            ${DashboardIcon("w-4 h-4 inline mr-1 -mt-0.5")}
+                            สรุป
+                        </button>
+                        <button id="theme-toggle" class="p-2 rounded-full text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 transition duration-200" title="Toggle Theme">
+                            ${ThemeIcon(state.theme === 'dark', "w-5 h-5")}
+                        </button>
+                    </div>
+                </div>
+            `;
+
+            // Attach Event Listeners
+            document.getElementById('nav-entry').addEventListener('click', () => setState({ page: 'entry' }));
+            document.getElementById('nav-dashboard').addEventListener('click', () => setState({ page: 'dashboard' }));
+            document.getElementById('theme-toggle').addEventListener('click', () => setState({ theme: state.theme === 'light' ? 'dark' : 'light' }));
+        };
+
+        const renderEntryPage = () => {
+            const calculationData = calculateData();
+            const { baseSalary, otRate, calculatedRecords } = calculationData;
+
+            // Salary Save Status Icon
+            let saveStatusEl = '';
+            if (state.salarySaveStatus === 'pending') {
+                saveStatusEl = `<span class="text-sky-500 text-sm flex items-center ml-2">${Spinner('w-4 h-4 mr-1')} กำลังบันทึก...</span>`;
+            } else if (state.salarySaveStatus === 'success') {
+                saveStatusEl = `<span class="text-green-500 text-sm flex items-center ml-2">✓ บันทึกแล้ว</span>`;
+            } else if (state.salarySaveStatus === 'error') {
+                saveStatusEl = `<span class="text-red-500 text-sm flex items-center ml-2">✗ บันทึกไม่สำเร็จ</span>`;
+            }
+
+            const monthOptions = getUniqueMonths().map(month => `
+                <option value="${month}" ${month === state.selectedMonthYear ? 'selected' : ''}>
+                    ${monthYearToThai(month)}
+                </option>
+            `).join('');
+            
+            // Record List HTML
+            const recordsList = calculatedRecords.length > 0 ? calculatedRecords.map(record => {
+                const isEditing = state.editingRecordId === record.id;
+                
+                const recordDisplay = isEditing ? 
+                    `
+                    <div class="flex flex-col space-y-2 w-full">
+                        <input type="date" id="edit-date-${record.id}" value="${state.editedDate}" class="p-2 border border-gray-300 dark:border-gray-600 rounded-lg dark:bg-gray-700 dark:text-gray-100 focus:ring-sky-500 focus:border-sky-500 text-sm w-full">
+                        <input type="number" step="0.5" id="edit-hours-${record.id}" value="${state.editedHours}" class="p-2 border border-gray-300 dark:border-gray-600 rounded-lg dark:bg-gray-700 dark:text-gray-100 focus:ring-sky-500 focus:border-sky-500 text-sm w-full" placeholder="ชั่วโมง OT">
+                    </div>
+                    <div class="flex space-x-2">
+                        <button data-action="save-edit" data-id="${record.id}" class="p-2 rounded-full bg-green-500 text-white hover:bg-green-600 transition duration-150" title="บันทึก">${SaveIcon("w-4 h-4")}</button>
+                        <button data-action="cancel-edit" data-id="${record.id}" class="p-2 rounded-full bg-red-500 text-white hover:bg-red-600 transition duration-150" title="ยกเลิก">${XIcon("w-4 h-4")}</button>
+                    </div>
+                    `
+                    :
+                    `
+                    <div class="flex-grow">
+                        <p class="font-medium text-gray-700 dark:text-gray-300">${dateToThai(record.date)}</p>
+                        <p class="text-sm text-gray-500 dark:text-gray-400">OT: ${record.otHours} ชม. | Rate: ${record.payMultiplier.toFixed(1)}x</p>
+                        <p class="text-sm font-semibold text-sky-600 dark:text-sky-400">เงิน OT: ${formatMoney(record.otPay)} บาท</p>
+                    </div>
+                    <div class="flex space-x-2">
+                        <button data-action="edit" data-id="${record.id}" class="p-2 rounded-full text-sky-600 dark:text-sky-400 hover:bg-sky-100 dark:hover:bg-gray-700 transition duration-150" title="แก้ไข">${EditIcon("w-4 h-4")}</button>
+                        <button data-action="delete" data-id="${record.id}" class="p-2 rounded-full text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-gray-700 transition duration-150" title="ลบ">${TrashIcon("w-4 h-4")}</button>
+                    </div>
+                    `;
+
+                return `
+                    <li class="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700 rounded-xl shadow-sm hover:shadow-md transition duration-200" data-id="${record.id}">
+                        ${recordDisplay}
+                    </li>
+                `;
+            }).join('') : `
+                <div class="text-center p-8 bg-gray-100 dark:bg-gray-700 rounded-xl text-gray-500 dark:text-gray-400">
+                    <p>ไม่มีข้อมูลโอทีสำหรับเดือน ${monthYearToThai(state.selectedMonthYear)}</p>
+                    <p class="mt-2 text-sm">กรุณาเพิ่มข้อมูลโอทีด้านบน</p>
+                </div>
+            `;
+            
+            const content = `
+                <div class="space-y-6">
+                    ${state.loading || state.dataLoading ? `
+                        <div class="flex justify-center items-center p-12">
+                            ${Spinner('w-10 h-10 mr-3')}
+                            <span class="text-lg font-semibold text-sky-600 dark:text-sky-400">กำลังโหลดข้อมูล...</span>
+                        </div>
+                    ` : ''}
+
+                    ${state.error ? `
+                        <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-xl relative dark:bg-red-900 dark:border-red-600 dark:text-red-300" role="alert">
+                            <strong class="font-bold">ข้อผิดพลาด!</strong>
+                            <span class="block sm:inline">${state.error}</span>
+                        </div>
+                    ` : ''}
+
+                    <!-- 1. Base Salary Input -->
+                    <div class="p-5 bg-white dark:bg-gray-800 rounded-xl shadow-lg border border-gray-200 dark:border-gray-700">
+                        <h2 class="text-lg font-bold text-sky-700 dark:text-sky-400 mb-4 flex items-center">${WalletIcon("w-5 h-5 mr-2")} เงินเดือนพื้นฐาน</h2>
+                        <div class="flex flex-col md:flex-row items-end space-y-3 md:space-y-0 md:space-x-3">
+                            <div class="flex-grow w-full">
+                                <label for="base-salary" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">เงินเดือน/เดือน (บาท)</label>
+                                <input type="number" id="base-salary" value="${baseSalary}" step="1000" class="w-full p-3 border border-gray-300 dark:border-gray-600 rounded-lg dark:bg-gray-700 dark:text-gray-100 focus:ring-sky-500 focus:border-sky-500 text-lg" placeholder="เช่น 25000">
+                            </div>
+                            <button id="save-salary" class="w-full md:w-auto px-5 py-3 bg-sky-600 text-white font-semibold rounded-lg hover:bg-sky-700 transition duration-200 shadow-md flex items-center justify-center" ${state.dataLoading ? 'disabled' : ''}>
+                                ${SaveIcon("w-5 h-5 mr-2")}
+                                บันทึก
+                            </button>
+                            ${saveStatusEl}
+                        </div>
+                        <p class="mt-3 text-sm text-gray-500 dark:text-gray-400">
+                            *อัตราโอทีมาตรฐาน 1.5x ชั่วโมงละ <span class="font-semibold text-sky-600 dark:text-sky-400">${formatMoney(otRate)}</span> บาท (อิงจาก 160 ชม./เดือน)
+                        </p>
+                    </div>
+
+                    <!-- 2. OT Entry -->
+                    <div class="p-5 bg-white dark:bg-gray-800 rounded-xl shadow-lg border border-gray-200 dark:border-gray-700">
+                        <h2 class="text-lg font-bold text-sky-700 dark:text-sky-400 mb-4 flex items-center">${TimerIcon("w-5 h-5 mr-2")} บันทึกชั่วโมงโอที</h2>
+                        <div class="flex flex-col md:flex-row items-center space-y-3 md:space-y-0 md:space-x-3">
+                            <div class="flex-grow w-full">
+                                <label for="ot-date" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">วันที่</label>
+                                <input type="date" id="ot-date" value="${state.newOtDate}" class="w-full p-3 border border-gray-300 dark:border-gray-600 rounded-lg dark:bg-gray-700 dark:text-gray-100 focus:ring-sky-500 focus:border-sky-500">
+                            </div>
+                            <div class="flex-grow w-full">
+                                <label for="ot-hours" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">ชั่วโมง OT (ชม.)</label>
+                                <input type="number" id="ot-hours" value="${state.newOtHours}" step="0.5" class="w-full p-3 border border-gray-300 dark:border-gray-600 rounded-lg dark:bg-gray-700 dark:text-gray-100 focus:ring-sky-500 focus:border-sky-500" placeholder="เช่น 4.0">
+                            </div>
+                            <button id="add-record" class="w-full md:w-auto mt-auto px-5 py-3 bg-green-600 text-white font-semibold rounded-lg hover:bg-green-700 transition duration-200 shadow-md" ${state.dataLoading ? 'disabled' : ''}>
+                                ${EntryIcon("w-5 h-5 mr-2")}
+                                เพิ่มข้อมูล
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- 3. OT Records List -->
+                    <div class="p-5 bg-white dark:bg-gray-800 rounded-xl shadow-lg border border-gray-200 dark:border-gray-700">
+                        <div class="flex justify-between items-center mb-4">
+                            <h2 class="text-lg font-bold text-sky-700 dark:text-sky-400 flex items-center">${CalendarDaysIcon("w-5 h-5 mr-2")} ข้อมูลโอทีที่บันทึกไว้</h2>
+                            
+                            <select id="month-selector" class="p-2 border border-gray-300 dark:border-gray-600 rounded-lg dark:bg-gray-700 dark:text-gray-100 text-sm focus:ring-sky-500 focus:border-sky-500">
+                                ${monthOptions}
+                            </select>
+                        </div>
+                        <ul id="ot-list" class="space-y-3">
+                            ${recordsList}
+                        </ul>
+                    </div>
+                </div>
+            `;
+            
+            // Render content and set up event delegation
+            const pageEl = document.getElementById('page-content');
+            pageEl.innerHTML = content;
+
+            // --- Attach Event Listeners to Entry Page ---
+            
+            // Base Salary
+            document.getElementById('base-salary').addEventListener('input', (e) => handleSalaryChange(e.target.value));
+            document.getElementById('save-salary').addEventListener('click', handleSaveSalary);
+
+            // New Record Input
+            document.getElementById('ot-date').addEventListener('change', (e) => setState({ newOtDate: e.target.value }));
+            document.getElementById('ot-hours').addEventListener('input', (e) => setState({ newOtHours: e.target.value }));
+            document.getElementById('add-record').addEventListener('click', handleAddRecord);
+
+            // Month Selector
+            document.getElementById('month-selector').addEventListener('change', (e) => {
+                setState({ selectedMonthYear: e.target.value, negotiationScript: '', otAdvice: '' }); // Clear LLM results on month change
+            });
+
+            // Record List (Delegation)
+            document.getElementById('ot-list').addEventListener('click', (e) => {
+                const button = e.target.closest('button');
+                if (!button) return;
+                
+                const action = button.getAttribute('data-action');
+                const id = button.getAttribute('data-id') || button.closest('li').getAttribute('data-id');
+                const record = calculatedRecords.find(r => r.id === id);
+
+                if (action === 'delete') {
+                    handleDeleteRecord(id);
+                } else if (action === 'edit' && record) {
+                    handleStartEdit(record);
+                } else if (action === 'cancel-edit') {
+                    handleCancelEdit();
+                } else if (action === 'save-edit') {
+                    // Get edited values from dynamically created inputs
+                    const dateInput = document.getElementById(`edit-date-${id}`);
+                    const hoursInput = document.getElementById(`edit-hours-${id}`);
+                    
+                    if (dateInput && hoursInput) {
+                        setState({
+                            editedDate: dateInput.value,
+                            editedHours: hoursInput.value
+                        });
+                        // Since setState triggers a full render, we need to defer the save logic slightly,
+                        // or better yet, make the input change immediately:
+                        state.editedDate = dateInput.value;
+                        state.editedHours = hoursInput.value;
+                        handleSaveEdit();
                     }
                 }
             });
 
-            if (initialAuthToken) {
-                signInWithCustomToken(firebaseAuth, initialAuthToken)
-                    .catch(e => {
-                        console.error("Error signing in with custom token:", e);
-                        setError("เกิดข้อผิดพลาดในการลงชื่อเข้าใช้: " + e.message);
-                        setLoading(false);
-                    });
-            }
-
-            return () => unsubscribe();
-        } catch (e) {
-            console.error("Firebase Initialization Error:", e);
-            setError("เกิดข้อผิดพลาดในการเริ่มต้น Firebase: " + e.message);
-            setLoading(false);
-        }
-    }, []);
-
-    // 2. DATA LOADING & REAL-TIME LISTENER
-    useEffect(() => {
-        if (!db || !userId) return;
-
-        const docPath = `/artifacts/${appId}/users/${userId}/${COLLECTION_NAME}/${DOC_ID}`;
-        const docRef = doc(db, docPath);
-        
-        setDataLoading(true);
-
-        const unsubscribe = onSnapshot(docRef, (docSnap) => {
-            if (docSnap.exists()) {
-                const data = docSnap.data();
-                setBaseSalary(data.baseSalary || 0);
-                setOtRecords(data.otRecords || []);
-                setError('');
-            } else {
-                console.log("No data found, initializing a new record.");
-                setBaseSalary(0);
-                setOtRecords([]);
-            }
-            setDataLoading(false);
-        }, (e) => {
-            console.error("Firestore Snapshot Error:", e);
-            setError("เกิดข้อผิดพลาดในการดึงข้อมูล: " + e.message);
-            setDataLoading(false);
-        });
-
-        return () => unsubscribe();
-    }, [db, userId]);
-
-    // 3. DATA SAVING FUNCTION
-    const saveToFirestore = useCallback(async (newSalary, newRecords, context = 'ot') => {
-        if (!db || !userId) {
-            setError("ฐานข้อมูลยังไม่พร้อมใช้งาน");
-            return;
-        }
-
-        const docPath = `/artifacts/${appId}/users/${userId}/${COLLECTION_NAME}/${DOC_ID}`;
-        const docRef = doc(db, docPath);
-
-        if (context === 'salary') setSalarySaveStatus('pending');
-        
-        try {
-            await setDoc(docRef, {
-                baseSalary: newSalary,
-                otRecords: newRecords,
-                updatedAt: new Date().toISOString()
-            }, { merge: true });
-            
-            setBaseSalary(newSalary);
-            setOtRecords(newRecords);
-            
-            if (context === 'salary') {
-                setSalarySaveStatus('success');
-                setTimeout(() => setSalarySaveStatus('idle'), 3000);
-            }
-        } catch (e) {
-            console.error("Error saving data:", e);
-            setError("เกิดข้อผิดพลาดในการบันทึกข้อมูล: " + e.message);
-            if (context === 'salary') setSalarySaveStatus('error');
-        } finally {
-            if (context !== 'salary') setDataLoading(false); 
-        }
-    }, [db, userId]);
-
-    // 4. ACTION HANDLERS
-    const handleSalaryChange = (e) => {
-        const salary = parseFloat(e.target.value) || 0;
-        setBaseSalary(salary);
-        if (salarySaveStatus !== 'pending') setSalarySaveStatus('idle'); 
-    };
-
-    const handleSaveSalary = () => {
-        saveToFirestore(baseSalary, otRecords, 'salary');
-    };
-
-    const handleAddRecord = () => {
-        const hours = parseFloat(newOtHours);
-        if (newOtDate && hours > 0) {
-            const newRecord = {
-                id: crypto.randomUUID(),
-                date: newOtDate,
-                otHours: hours,
-            };
-            const updatedRecords = [...otRecords, newRecord].sort((a, b) => new Date(a.date) - new Date(b.date));
-            
-            saveToFirestore(baseSalary, updatedRecords);
-            setNewOtHours('');
-            
-            const savedDate = newOtDate;
-            setNewOtDate(new Date().toISOString().substring(0, 10));
-
-            // อัปเดต selectedMonthYear ไปยังเดือนที่มีการเพิ่มข้อมูลล่าสุด
-            setSelectedMonthYear(savedDate.substring(0, 7)); 
-        } else {
-            setError('กรุณากรอกวันที่และชั่วโมงโอทีให้ถูกต้อง');
-        }
-    };
-
-    const handleDeleteRecord = (id) => {
-        // Clear editing state if the record being deleted is currently being edited
-        if (editingRecordId === id) {
-            setEditingRecordId(null);
-        }
-        const updatedRecords = otRecords.filter(record => record.id !== id);
-        saveToFirestore(baseSalary, updatedRecords);
-    };
-
-    // --- EDIT HANDLERS ---
-    const handleStartEdit = (record) => {
-        setEditingRecordId(record.id);
-        setEditedDate(record.date);
-        setEditedHours(record.otHours.toString());
-        setError('');
-    };
-
-    const handleCancelEdit = () => {
-        setEditingRecordId(null);
-        setEditedDate('');
-        setEditedHours('');
-        setError('');
-    };
-
-    const handleSaveEdit = () => {
-        const hours = parseFloat(editedHours);
-        if (editedDate && hours > 0) {
-            const updatedRecords = otRecords.map(record => 
-                record.id === editingRecordId
-                    ? { ...record, date: editedDate, otHours: hours }
-                    : record
-            );
-            
-            // Re-sort records after editing as the date might have changed
-            const sortedRecords = updatedRecords.sort((a, b) => new Date(a.date) - new Date(b.date) || a.id.localeCompare(b.id));
-            
-            saveToFirestore(baseSalary, sortedRecords);
-            handleCancelEdit(); // Reset editing state
-            
-            // Ensure the month selector reflects the month of the edited record
-            setSelectedMonthYear(editedDate.substring(0, 7)); 
-
-        } else {
-            setError('กรุณากรอกวันที่และชั่วโมงโอทีให้ถูกต้องสำหรับการแก้ไข');
-        }
-    };
-    // --- END EDIT HANDLERS ---
-
-
-    // 5. LLM Feature Handler 1: Negotiation Script
-    const handleGenerateNegotiationScript = async () => {
-        if (isScriptLoading) return;
-
-        // ใช้ข้อมูลจากเดือนที่ถูกเลือก
-        const { baseSalary, totalEffectiveOtHours, totalOtPay } = calculationData; 
-
-        if (baseSalary <= 0) {
-            setError('กรุณาบันทึกเงินเดือนพื้นฐานก่อนใช้ฟีเจอร์นี้');
-            setTimeout(() => setError(''), 5000);
-            return;
-        }
-        
-        if (totalOtPay <= 0) {
-             setError(`ไม่มีข้อมูล OT ในเดือน ${new Date(selectedMonthYear + '-01').toLocaleDateString('th-TH', { month: 'long', year: 'numeric' })} กรุณาเลือกเดือนที่มีข้อมูล`);
-            setTimeout(() => setError(''), 5000);
-            return;
-        }
-
-
-        setIsScriptLoading(true);
-        setNegotiationScript('');
-        setError('');
-
-        const monthName = new Date(selectedMonthYear + '-01').toLocaleDateString('th-TH', { month: 'long', year: 'numeric' });
-
-        const prompt = `
-            Draft a professional and persuasive script for a salary review or negotiation meeting.
-            The script should focus on my dedication and workload, supported by the following financial data for the period of ${monthName}:
-            - Current Monthly Base Salary: ${baseSalary.toLocaleString()} THB
-            - Total Overtime Pay logged in ${monthName}: ${totalOtPay.toLocaleString()} THB
-            - Total Overtime Hours (Effective Value at 1.5x rate): ${totalEffectiveOtHours.toFixed(1)} hours
-
-            The script must be in Thai, concise, encouraging, and focused on requesting a review of the base salary based on the consistent workload (evidenced by the OT).
-            Structure the response as a formal, short email or a bulleted speaking script.
-        `;
-
-        const systemPrompt = "You are a world-class HR consultant. Provide a concise, professional, and encouraging script in Thai for a user to request a base salary review, citing their recorded workload and overtime. Use a confident but polite tone.";
-
-        try {
-            const result = await runLLMGeneration(prompt, systemPrompt);
-            setNegotiationScript(result.text);
-        } catch (e) {
-            console.error("Gemini API Error:", e);
-            setError("เกิดข้อผิดพลาดในการสร้างสคริปต์เจรจาเงินเดือน: " + e.message);
-            setNegotiationScript("ไม่สามารถสร้างสคริปต์ได้เนื่องจากข้อผิดพลาด: " + e.message);
-        } finally {
-            setIsScriptLoading(false);
-        }
-    };
-
-    // 6. LLM Feature Handler 2: OT Advice
-    const handleGenerateOtAdvice = async () => {
-        if (isAdviceLoading) return;
-
-        const { baseSalary, totalOtHours, totalOtPay } = calculationData;
-
-        if (totalOtPay <= 0) {
-            setError(`ไม่มีข้อมูล OT ในเดือน ${new Date(selectedMonthYear + '-01').toLocaleDateString('th-TH', { month: 'long', year: 'numeric' })} กรุณาเลือกเดือนที่มีข้อมูล`);
-            setTimeout(() => setError(''), 5000);
-            return;
-        }
-
-        setIsAdviceLoading(true);
-        setOtAdvice('');
-        setError('');
-        
-        const monthName = new Date(selectedMonthYear + '-01').toLocaleDateString('th-TH', { month: 'long', year: 'numeric' });
-
-        const prompt = `
-            Analyze the user's recent overtime (OT) data in ${monthName}: 
-            Total OT Hours logged (Actual): ${totalOtHours.toFixed(1)} hours, 
-            Total OT Pay: ${totalOtPay.toLocaleString()} THB, 
-            Base Salary: ${baseSalary.toLocaleString()} THB.
-            
-            **Crucial context:** The user's calculation includes a 3.0x rate for Sunday OT (2x hours * 1.5x rate).
-            
-            Provide concise and actionable advice (in Thai) focused on one key area: 
-            Either a strategy for optimizing/maximizing legal OT earnings based on common labor practices (e.g., maximizing weekend or holiday rates) OR a tip for minimizing the need for OT while maintaining productivity (work-life balance advice).
-            
-            Choose the most relevant suggestion based on the context of consistent OT records and the high Sunday multiplier.
-            The response should be 2-3 short, clear paragraphs in Thai.
-        `;
-
-        const systemPrompt = "You are a specialized HR and efficiency analyst providing general advice in Thai on optimizing overtime and work-life balance, grounded in common labor practices and time management principles. Do not provide a script; provide actionable advice.";
-
-        try {
-            const result = await runLLMGeneration(prompt, systemPrompt);
-            setOtAdvice(result.text);
-        } catch (e) {
-            console.error("Gemini API Error:", e);
-            setError("เกิดข้อผิดพลาดในการสร้างคำแนะนำ OT: " + e.message);
-            setOtAdvice("ไม่สามารถสร้างคำแนะนำได้เนื่องจากข้อผิดพลาด: " + e.message);
-        } finally {
-            setIsAdviceLoading(false);
-        }
-    };
-
-
-    // 7. CALCULATION LOGIC & FILTERING
-    const uniqueMonths = useMemo(() => {
-        const months = new Set();
-        otRecords.forEach(record => {
-            months.add(record.date.substring(0, 7)); // YYYY-MM
-        });
-        
-        // Ensure the current month is always available if no records exist yet
-        const currentMonthYear = new Date().toISOString().substring(0, 7);
-        if (!months.has(currentMonthYear)) {
-            months.add(currentMonthYear);
-        }
-        
-        return Array.from(months).sort().reverse();
-    }, [otRecords]);
-
-    const calculationData = useMemo(() => {
-        // Assume 20 working days/month * 8 hours/day = 160 hours
-        const hourlyRate = baseSalary > 0 ? baseSalary / 160 : 0;
-        
-        // Define standard 1.5x rate for reference
-        const otRate1_5x = hourlyRate * 1.5; 
-
-        // Filter for records in the SELECTED month for Dashboard calculations
-        const monthlyOtRecords = otRecords.filter(record => 
-            record.date.startsWith(selectedMonthYear)
-        );
-
-        let totalOtHours = 0; // Actual hours worked
-        let totalOtPay = 0;
-        let totalEffectiveOtHours = 0; // Hours calculated for dashboard summary (equivalent hours at 1.5x rate)
-
-        const weeklySummary = {};
-        let period1Pay = 0; // 1st to 15th
-        let period2Pay = 0; // 16th to end of month
-        
-        const calculatedRecords = []; // Array to store records with calculated fields
-
-        monthlyOtRecords.forEach(record => {
-            const payMultiplier = getOtMultiplier(record.date); // 1.5 or 3.0
-            const effectiveOtRate = hourlyRate * payMultiplier;
-            
-            const otPay = record.otHours * effectiveOtRate;
-            
-            // Effective hours calculation: actualHours * (payMultiplier / 1.5)
-            // This translates 4 hours at 3.0x to 8 effective hours at 1.5x
-            const effectiveHours = record.otHours * (payMultiplier / 1.5);
-            
-            totalOtHours += record.otHours; // Actual hours
-            totalEffectiveOtHours += effectiveHours; // Effective hours 
-            totalOtPay += otPay;
-
-            // Store calculated fields for UI rendering
-            calculatedRecords.push({
-                ...record,
-                effectiveOtRate,
-                payMultiplier,
-                effectiveHours,
-                otPay
+            // Listener for live input on edit fields (since they are re-rendered)
+            pageEl.addEventListener('input', (e) => {
+                if (e.target.id.startsWith('edit-date-')) {
+                    setState({ editedDate: e.target.value });
+                } else if (e.target.id.startsWith('edit-hours-')) {
+                    setState({ editedHours: e.target.value });
+                }
             });
 
-            const date = new Date(record.date);
-            const dateDay = date.getDate();
-            const weekKey = getWeekNumber(date);
-
-            if (!weeklySummary[weekKey]) {
-                weeklySummary[weekKey] = { 
-                    weekKey, 
-                    records: [], 
-                    totalHours: 0, 
-                    totalPay: 0, 
-                    startDate: date, 
-                    endDate: date,
-                    totalEffectiveHours: 0
-                };
+            // Trigger re-render to capture potential live input changes (needed for editing state)
+            if (state.editingRecordId) {
+                // Attach blur listeners for edit inputs to capture latest values before clicking save
+                const dateInput = document.getElementById(`edit-date-${state.editingRecordId}`);
+                const hoursInput = document.getElementById(`edit-hours-${state.editingRecordId}`);
+                if (dateInput) dateInput.addEventListener('input', (e) => state.editedDate = e.target.value);
+                if (hoursInput) hoursInput.addEventListener('input', (e) => state.editedHours = e.target.value);
             }
-            // Update weekly summary with calculated values
-            weeklySummary[weekKey].records.push({...record, effectiveOtRate, payMultiplier, effectiveHours});
-            weeklySummary[weekKey].totalHours += record.otHours;
-            weeklySummary[weekKey].totalEffectiveHours += effectiveHours;
-            weeklySummary[weekKey].totalPay += otPay;
-
-            if (date < weeklySummary[weekKey].startDate) {
-                weeklySummary[weekKey].startDate = date;
-            }
-            if (date > weeklySummary[weekKey].endDate) {
-                weeklySummary[weekKey].endDate = date;
-            }
-
-            // Calculate pay periods
-            if (dateDay >= 1 && dateDay <= 15) {
-                period1Pay += otPay;
-            } else if (dateDay >= 16) {
-                period2Pay += otPay;
-            }
-        });
-
-        const sortedWeeklySummary = Object.values(weeklySummary).sort((a, b) => {
-            return a.weekKey - b.weekKey;
-        });
-        
-        // Calculate dynamic dates for the selected month
-        const [year, month] = selectedMonthYear.split('-').map(Number);
-        // Next month's 7th (for 16th to end of selected month's OT)
-        const nextMonth7th = new Date(year, month, 7).toLocaleDateString('th-TH', { day: 'numeric', month: 'long', year: 'numeric' }); 
-        // Selected month's 22nd (for 1st to 15th of selected month's OT)
-        const currentMonth22nd = new Date(year, month - 1, 22).toLocaleDateString('th-TH', { day: 'numeric', month: 'long', year: 'numeric' }); 
-
-        // Sort calculated records by date descending (latest first)
-        const sortedCalculatedRecords = calculatedRecords.sort((a, b) => new Date(b.date) - new Date(a.date) || a.id.localeCompare(b.id));
-
-
-        return {
-            baseSalary,
-            hourlyRate,
-            otRate: otRate1_5x, // Standard 1.5x rate for reference
-            totalOtHours, // Actual hours worked
-            totalEffectiveOtHours, // Hours equivalent to standard 1.5x OT
-            totalOtPay,
-            weeklySummary: sortedWeeklySummary,
-            period1Pay,
-            period2Pay,
-            currentMonth22nd,
-            nextMonth7th,
-            calculatedRecords: sortedCalculatedRecords
         };
-    }, [baseSalary, otRecords, selectedMonthYear]);
 
+        const renderDashboardPage = () => {
+            const calculationData = calculateData();
+            const { 
+                baseSalary, hourlyRate, otRate, totalOtHours, totalEffectiveOtHours, 
+                totalOtPay, weeklySummary, period1Pay, period2Pay, 
+                currentMonth22nd, nextMonth7th
+            } = calculationData;
 
-    // 8. UI COMPONENTS
-    const formatMoney = (amount) => {
-        return (amount || 0).toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    };
+            const monthName = monthYearToThai(state.selectedMonthYear);
 
-    const dateToThai = (dateString) => {
-        if (!dateString) return 'N/A';
-        const date = new Date(dateString);
-        const dayNames = ['อาทิตย์', 'จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์', 'เสาร์'];
-        const dayOfWeek = date.getDay();
-        const datePart = date.toLocaleDateString('th-TH', { day: 'numeric', month: 'short', year: 'numeric' });
-        return `${datePart} (${dayNames[dayOfWeek]})`;
-    }
+            const uniqueMonths = getUniqueMonths().map(month => `
+                <option value="${month}" ${month === state.selectedMonthYear ? 'selected' : ''}>
+                    ${monthYearToThai(month)}
+                </option>
+            `).join('');
 
-    const Header = ({ page, setPage, userId, dataLoading, theme, toggleTheme }) => (
-        <div className="flex justify-between items-center p-4 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 sticky top-0 z-10 shadow-md">
-            <h1 className="text-xl font-extrabold text-sky-700 dark:text-sky-400">คำนวณเงินเดือน & โอที</h1>
-            <div className="flex space-x-2">
-                <button
-                    onClick={() => setPage('entry')}
-                    className={`text-sm px-3 py-1.5 rounded-full font-semibold transition duration-200 ${page === 'entry' ? 'bg-sky-600 text-white shadow-lg' : 'bg-gray-100 dark:bg-gray-700 text-sky-600 dark:text-sky-400 hover:bg-sky-50 dark:hover:bg-gray-600 hover:text-sky-700'}`}
-                    disabled={dataLoading}
-                >
-                    <EntryIcon className="w-4 h-4 inline mr-1 -mt-0.5" />
-                    กรอกข้อมูล
-                </button>
-                <button
-                    onClick={() => setPage('dashboard')}
-                    className={`text-sm px-3 py-1.5 rounded-full font-semibold transition duration-200 ${page === 'dashboard' ? 'bg-sky-600 text-white shadow-lg' : 'bg-gray-100 dark:bg-gray-700 text-sky-600 dark:text-sky-400 hover:bg-sky-50 dark:hover:bg-gray-600 hover:text-sky-700'}`}
-                    disabled={dataLoading}
-                >
-                    <DashboardIcon className="w-4 h-4 inline mr-1 -mt-0.5" />
-                    Dashboard
-                </button>
-                <button
-                    onClick={toggleTheme}
-                    className="p-2 rounded-full font-semibold transition duration-200 bg-gray-100 dark:bg-gray-700 text-sky-600 dark:text-yellow-300 hover:bg-gray-200 dark:hover:bg-gray-600 shadow-sm"
-                    title={theme === 'dark' ? 'สลับไปโหมดสว่าง' : 'สลับไปโหมดมืด'}
-                >
-                    <ThemeIcon isDark={theme === 'dark'} className="w-5 h-5" />
-                </button>
-            </div>
-            {userId && (
-                <div className="hidden md:block text-xs text-gray-500 dark:text-gray-400 bg-gray-50 dark:bg-gray-700 p-2 rounded-lg border dark:border-gray-600">
-                    <span className="font-medium text-sky-500">UID:</span> {userId}
-                </div>
-            )}
-        </div>
-    );
+            const weeklyCards = weeklySummary.map(week => {
+                // Format week date range
+                const startDateStr = week.startDate.toLocaleDateString('th-TH', { day: 'numeric', month: 'short' });
+                const endDateStr = week.endDate.toLocaleDateString('th-TH', { day: 'numeric', month: 'short' });
 
-    const SaveStatusIndicator = ({ status }) => {
-        switch (status) {
-            case 'pending':
-                return (
-                    <span className="text-sm text-sky-600 dark:text-sky-400 flex items-center">
-                        <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-sky-600 dark:text-sky-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                        </svg>
-                        กำลังบันทึก...
-                    </span>
-                );
-            case 'success':
-                return (
-                    <span className="text-sm text-emerald-600 dark:text-emerald-400 flex items-center font-semibold">
-                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mr-1" viewBox="0 0 20 20" fill="currentColor">
-                            <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
-                        </svg>
-                        บันทึกสำเร็จ!
-                    </span>
-                );
-            case 'error':
-                return (
-                    <span className="text-sm text-red-600 flex items-center font-semibold">
-                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mr-1" viewBox="0 0 20 20" fill="currentColor">
-                            <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
-                        </svg>
-                        ข้อผิดพลาด!
-                    </span>
-                );
-            case 'idle':
-            default:
-                return null;
-        }
-    };
-
-
-    const EntryPage = () => {
-        const recordsToDisplay = calculationData.calculatedRecords || [];
-
-        return (
-            <div className="p-4 md:p-8 space-y-8 max-w-4xl mx-auto">
-                
-                {/* Base Salary Input */}
-                <div className="bg-white dark:bg-gray-800 p-6 rounded-xl shadow-lg border border-sky-100 dark:border-sky-800">
-                    <h2 className="text-xl font-bold mb-4 text-sky-700 dark:text-sky-400 flex items-center">
-                        <WalletIcon className="w-7 h-7 mr-2 text-sky-600 dark:text-sky-400" />
-                        1. กรอก/แก้ไข เงินเดือนพื้นฐาน (ต่อเดือน)
-                    </h2>
-                    <div className="flex flex-col sm:flex-row items-end sm:space-x-4 space-y-4 sm:space-y-0">
-                        <div className="flex-grow w-full">
-                            <label htmlFor="baseSalary" className="block text-sm font-medium text-gray-600 dark:text-gray-300">เงินเดือน (บาท)</label>
-                            <input
-                                id="baseSalary"
-                                type="number"
-                                value={baseSalary || ''}
-                                onChange={handleSalaryChange}
-                                onBlur={handleSaveSalary}
-                                className="mt-1 block w-full rounded-lg border-2 border-gray-300 dark:border-gray-600 p-2.5 text-lg focus:border-sky-500 focus:ring-sky-500 transition bg-white dark:bg-gray-700 dark:text-gray-100"
-                                placeholder="เช่น 25000"
-                                min="0"
-                            />
+                return `
+                    <div class="p-4 bg-gray-50 dark:bg-gray-700 rounded-xl shadow-md border border-gray-200 dark:border-gray-600">
+                        <p class="font-bold text-sky-700 dark:text-sky-400">${startDateStr} - ${endDateStr}</p>
+                        <div class="mt-2 text-sm space-y-1">
+                            <p class="flex justify-between items-center text-gray-700 dark:text-gray-300">
+                                <span>OT จริง:</span>
+                                <span class="font-semibold">${week.totalHours.toFixed(1)} ชม.</span>
+                            </p>
+                            <p class="flex justify-between items-center text-gray-700 dark:text-gray-300">
+                                <span>OT เทียบเท่า 1.5x:</span>
+                                <span class="font-semibold text-orange-600 dark:text-orange-400">${week.totalEffectiveHours.toFixed(1)} ชม.</span>
+                            </p>
+                            <p class="flex justify-between items-center text-lg font-extrabold border-t pt-2 border-gray-300 dark:border-gray-600 text-green-700 dark:text-green-400">
+                                <span>รายได้ OT:</span>
+                                <span>${formatMoney(week.totalPay)} THB</span>
+                            </p>
                         </div>
-                        <button
-                            onClick={handleSaveSalary}
-                            className="w-full sm:w-auto px-5 py-2.5 bg-emerald-500 text-white font-bold rounded-lg hover:bg-emerald-600 transition duration-150 shadow-md flex items-center justify-center text-base"
-                            disabled={dataLoading}
-                        >
-                            {dataLoading && salarySaveStatus !== 'success' ? 'กำลังบันทึก...' : 'บันทึกเงินเดือน'}
-                        </button>
                     </div>
-                    <div className="mt-3 flex justify-between items-center">
-                        <p className="text-xs text-gray-500 dark:text-gray-400">อัตราต่อชั่วโมงโดยประมาณ: {formatMoney(calculationData.hourlyRate)} บาท (ฐาน 160 ชม./เดือน)</p>
-                        <SaveStatusIndicator status={salarySaveStatus} />
+                `;
+            }).join('');
+            
+            const totalSummary = `
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <!-- Total OT Pay -->
+                    <div class="bg-sky-500 dark:bg-sky-700 text-white p-5 rounded-xl shadow-xl">
+                        <div class="flex items-center space-x-3 mb-2">
+                            ${WalletIcon("w-6 h-6")}
+                            <h3 class="text-xl font-bold">รวมเงิน OT เดือน ${monthName}</h3>
+                        </div>
+                        <p class="text-4xl font-extrabold mt-2">${formatMoney(totalOtPay)}</p>
+                        <p class="text-sm">บาท (THB)</p>
+                    </div>
+
+                    <!-- Total Effective Hours -->
+                    <div class="bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 p-5 rounded-xl shadow-xl border border-sky-300 dark:border-sky-700">
+                        <div class="flex items-center space-x-3 mb-2">
+                            ${ClockIcon("w-6 h-6 text-sky-600 dark:text-sky-400")}
+                            <h3 class="text-xl font-bold text-sky-700 dark:text-sky-400">OT เทียบเท่า (1.5x)</h3>
+                        </div>
+                        <p class="text-4xl font-extrabold mt-2 text-orange-600 dark:text-orange-400">${totalEffectiveOtHours.toFixed(1)}</p>
+                        <p class="text-sm text-gray-500 dark:text-gray-400">ชั่วโมง (อ้างอิงฐาน 1.5x)</p>
+                    </div>
+
+                    <!-- Base Salary Info -->
+                    <div class="md:col-span-2 bg-gray-100 dark:bg-gray-700 p-5 rounded-xl border border-gray-300 dark:border-gray-600">
+                        <h3 class="text-lg font-bold text-gray-700 dark:text-gray-300 mb-2">ข้อมูลเงินเดือนพื้นฐาน</h3>
+                        <div class="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
+                            <p class="text-gray-600 dark:text-gray-400">เงินเดือน/เดือน:</p>
+                            <p class="font-semibold text-right">${formatMoney(baseSalary)} THB</p>
+                            <p class="text-gray-600 dark:text-gray-400">อัตราต่อชั่วโมง (ฐาน):</p>
+                            <p class="font-semibold text-right">${formatMoney(hourlyRate)} THB</p>
+                            <p class="text-gray-600 dark:text-gray-400">อัตรา OT 1.5x:</p>
+                            <p class="font-semibold text-right text-sky-600 dark:text-sky-400">${formatMoney(otRate)} THB</p>
+                        </div>
                     </div>
                 </div>
+            `;
 
-                {/* OT Record Input */}
-                <div className="bg-white dark:bg-gray-800 p-6 rounded-xl shadow-lg border border-rose-100 dark:border-rose-800">
-                    <h2 className="text-xl font-bold mb-4 text-rose-700 dark:text-rose-400 flex items-center">
-                        <TimerIcon className="w-7 h-7 mr-2 text-rose-600 dark:text-rose-400" />
-                        2. บันทึกรายการโอที (OT)
-                    </h2>
-                    <div className="grid grid-cols-1 sm:grid-cols-4 gap-4 items-end">
-                        <div className="sm:col-span-2">
-                            <label htmlFor="otDate" className="block text-sm font-medium text-gray-600 dark:text-gray-300">วันที่ทำโอที</label>
-                            <input
-                                id="otDate"
-                                type="date"
-                                value={newOtDate}
-                                onChange={(e) => setNewOtDate(e.target.value)}
-                                className="mt-1 block w-full rounded-lg border-2 border-gray-300 dark:border-gray-600 p-2.5 transition bg-white dark:bg-gray-700 dark:text-gray-100"
-                            />
-                        </div>
-                        <div className="sm:col-span-1">
-                            <label htmlFor="otHours" className="block text-sm font-medium text-gray-600 dark:text-gray-300">ชั่วโมงโอที (OT Hours)</label>
-                            <input
-                                id="otHours"
-                                type="number"
-                                value={newOtHours}
-                                onChange={(e) => setNewOtHours(e.target.value)}
-                                className="mt-1 block w-full rounded-lg border-2 border-gray-300 dark:border-gray-600 p-2.5 text-lg focus:border-rose-500 focus:ring-rose-500 transition bg-white dark:bg-gray-700 dark:text-gray-100"
-                                placeholder="เช่น 2.5"
-                                min="0"
-                                step="0.5"
-                            />
-                        </div>
-                        <button
-                            onClick={handleAddRecord}
-                            className="w-full sm:col-span-1 px-5 py-2.5 bg-rose-500 text-white font-bold rounded-lg hover:bg-rose-600 transition duration-150 shadow-md flex items-center justify-center text-base"
-                            disabled={dataLoading || baseSalary === 0}
-                        >
-                            เพิ่มรายการ OT
-                        </button>
+            const payPeriods = `
+                <h3 class="text-xl font-bold text-sky-700 dark:text-sky-400 mt-6 mb-3 flex items-center">${BarChart3Icon("w-6 h-6 mr-2")} สรุปตามงวดการจ่าย</h3>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div class="p-4 bg-white dark:bg-gray-800 rounded-xl shadow-md border border-green-300 dark:border-green-700">
+                        <p class="text-sm text-gray-500 dark:text-gray-400">OT ช่วง 1-15 ${monthName}</p>
+                        <p class="font-semibold text-lg text-green-600 dark:text-green-400 mt-1">จ่ายประมาณ ${currentMonth22nd}</p>
+                        <p class="text-3xl font-extrabold mt-2">${formatMoney(period1Pay)}</p>
+                        <p class="text-sm text-gray-600 dark:text-gray-400">บาท</p>
                     </div>
-                    {baseSalary === 0 && <p className="mt-3 text-xs text-red-500">** กรุณากรอกเงินเดือนพื้นฐานก่อนบันทึกรายการ OT **</p>}
+                    <div class="p-4 bg-white dark:bg-gray-800 rounded-xl shadow-md border border-green-300 dark:border-green-700">
+                        <p class="text-sm text-gray-500 dark:text-gray-400">OT ช่วง 16-สิ้นเดือน ${monthName}</p>
+                        <p class="font-semibold text-lg text-green-600 dark:text-green-400 mt-1">จ่ายประมาณ ${nextMonth7th}</p>
+                        <p class="text-3xl font-extrabold mt-2">${formatMoney(period2Pay)}</p>
+                        <p class="text-sm text-gray-600 dark:text-gray-400">บาท</p>
+                    </div>
                 </div>
+                <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">*วันที่จ่ายเป็นเพียงการประมาณการณ์ตามรอบเงินเดือนทั่วไป</p>
+            `;
+            
+            const llmFeatures = `
+                <h3 class="text-xl font-bold text-sky-700 dark:text-sky-400 mt-8 mb-3 flex items-center">${TrendingUpIcon("w-6 h-6 mr-2")} เครื่องมือวิเคราะห์ด้วย AI</h3>
+                <div class="space-y-4">
+                    <!-- Negotiation Script -->
+                    <div class="p-5 bg-white dark:bg-gray-800 rounded-xl shadow-lg border border-gray-200 dark:border-gray-700">
+                        <div class="flex justify-between items-center mb-3">
+                            <h4 class="font-bold flex items-center text-gray-700 dark:text-gray-300">${NegotiationIcon("w-5 h-5 mr-2")} สคริปต์เจรจาเงินเดือน</h4>
+                            <button id="generate-script" class="px-4 py-2 bg-purple-600 text-white font-semibold rounded-full text-sm hover:bg-purple-700 transition duration-200 flex items-center" ${state.isScriptLoading || totalOtPay <= 0 ? 'disabled' : ''}>
+                                ${state.isScriptLoading ? Spinner('w-4 h-4 mr-2') : ''}
+                                สร้างสคริปต์
+                            </button>
+                        </div>
+                        <div class="mt-3 p-3 bg-gray-100 dark:bg-gray-700 rounded-lg whitespace-pre-wrap text-sm text-gray-700 dark:text-gray-300 min-h-[50px] flex items-center">
+                            ${state.negotiationScript || (totalOtPay > 0 ? 'กด "สร้างสคริปต์" เพื่อรับข้อความสำหรับเจรจาเงินเดือน โดยอ้างอิงจากชั่วโมง OT ในเดือนนี้' : 'ไม่มีข้อมูล OT เพื่อใช้สร้างสคริปต์เจรจา')}
+                        </div>
+                    </div>
 
-                {/* Existing OT Records List */}
-                <div className="bg-gray-50 dark:bg-gray-900 p-6 rounded-xl shadow-inner border border-gray-200 dark:border-gray-700">
-                    <h3 className="text-lg font-bold mb-4 text-gray-700 dark:text-gray-300">
-                        รายการ OT ที่บันทึกแล้ว ({recordsToDisplay.length} รายการ)
-                    </h3>
-                    
-                    <div className="mb-4 flex flex-col sm:flex-row items-center space-y-2 sm:space-y-0 sm:space-x-4">
-                        <label htmlFor="monthFilter" className="text-sm font-medium text-gray-600 dark:text-gray-300 flex-shrink-0">
-                            เลือกเดือนที่ต้องการดู:
-                        </label>
-                        <select
-                            id="monthFilter"
-                            value={selectedMonthYear}
-                            onChange={(e) => {
-                                setSelectedMonthYear(e.target.value);
-                                handleCancelEdit(); // Cancel any ongoing edits when month changes
-                            }}
-                            className="block w-full sm:w-60 rounded-lg border-gray-300 dark:border-gray-600 p-2 border shadow-sm focus:border-sky-500 focus:ring-sky-500 transition bg-white dark:bg-gray-700 dark:text-gray-100 text-sm"
-                        >
-                            {uniqueMonths.length > 0 ? (
-                                uniqueMonths.map(monthYear => (
-                                    <option key={monthYear} value={monthYear}>
-                                        {new Date(monthYear + '-01').toLocaleDateString('th-TH', { month: 'long', year: 'numeric' })}
-                                    </option>
-                                ))
-                            ) : (
-                                <option value={new Date().toISOString().substring(0, 7)}>
-                                    {new Date().toLocaleDateString('th-TH', { month: 'long', year: 'numeric' })} (ไม่มีข้อมูล OT)
-                                </option>
-                            )}
+                    <!-- OT Advice -->
+                    <div class="p-5 bg-white dark:bg-gray-800 rounded-xl shadow-lg border border-gray-200 dark:border-gray-700">
+                        <div class="flex justify-between items-center mb-3">
+                            <h4 class="font-bold flex items-center text-gray-700 dark:text-gray-300">${LightbulbIcon("w-5 h-5 mr-2")} คำแนะนำ OT และ Work-Life Balance</h4>
+                            <button id="generate-advice" class="px-4 py-2 bg-fuchsia-600 text-white font-semibold rounded-full text-sm hover:bg-fuchsia-700 transition duration-200 flex items-center" ${state.isAdviceLoading || totalOtPay <= 0 ? 'disabled' : ''}>
+                                ${state.isAdviceLoading ? Spinner('w-4 h-4 mr-2') : ''}
+                                ขอคำแนะนำ
+                            </button>
+                        </div>
+                        <div class="mt-3 p-3 bg-gray-100 dark:bg-gray-700 rounded-lg whitespace-pre-wrap text-sm text-gray-700 dark:text-gray-300 min-h-[50px] flex items-center">
+                            ${state.otAdvice || (totalOtPay > 0 ? 'กด "ขอคำแนะนำ" เพื่อรับคำแนะนำในการจัดการ OT และสมดุลชีวิตการทำงาน' : 'ไม่มีข้อมูล OT เพื่อใช้ขอคำแนะนำ')}
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            const content = `
+                <div class="space-y-6">
+                    ${state.error ? `
+                        <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-xl relative dark:bg-red-900 dark:border-red-600 dark:text-red-300" role="alert">
+                            <strong class="font-bold">ข้อผิดพลาด!</strong>
+                            <span class="block sm:inline">${state.error}</span>
+                        </div>
+                    ` : ''}
+
+                    <div class="flex justify-between items-center">
+                        <h2 class="text-2xl font-extrabold text-sky-700 dark:text-sky-400">สรุปข้อมูล OT ประจำเดือน</h2>
+                        <select id="month-selector-dashboard" class="p-2 border border-gray-300 dark:border-gray-600 rounded-lg dark:bg-gray-700 dark:text-gray-100 text-sm focus:ring-sky-500 focus:border-sky-500">
+                            ${uniqueMonths}
                         </select>
                     </div>
 
-                    <div className="space-y-2 max-h-96 overflow-y-auto">
-                        {recordsToDisplay.length === 0 ? (
-                            <p className="text-sm text-gray-500 italic">
-                                ไม่มีรายการโอทีที่บันทึกไว้สำหรับเดือน {new Date(selectedMonthYear + '-01').toLocaleDateString('th-TH', { month: 'long', year: 'numeric' })}
-                            </p>
-                        ) : (
-                            recordsToDisplay.map((record) => {
-                                const isEditing = record.id === editingRecordId;
-                                const isSunday = record.payMultiplier === 3.0;
-
-                                if (isEditing) {
-                                    return (
-                                        <div key={record.id} className="flex flex-col sm:flex-row sm:justify-between items-start sm:items-center p-3 bg-yellow-50 dark:bg-yellow-900 rounded-lg shadow-md border-2 border-yellow-300 dark:border-yellow-700 transition space-y-2 sm:space-y-0">
-                                            
-                                            {/* Edit Inputs */}
-                                            <div className='flex flex-col sm:flex-row sm:items-center space-y-2 sm:space-y-0 sm:space-x-3 w-full sm:w-2/3'>
-                                                <input
-                                                    type="date"
-                                                    value={editedDate}
-                                                    onChange={(e) => setEditedDate(e.target.value)}
-                                                    className="w-full sm:w-1/2 rounded-lg border border-yellow-400 dark:border-yellow-600 p-1.5 text-sm bg-white dark:bg-gray-700 dark:text-gray-100"
-                                                />
-                                                <input
-                                                    type="number"
-                                                    value={editedHours}
-                                                    onChange={(e) => setEditedHours(e.target.value)}
-                                                    className="w-full sm:w-1/2 rounded-lg border border-yellow-400 dark:border-yellow-600 p-1.5 text-sm bg-white dark:bg-gray-700 dark:text-gray-100"
-                                                    placeholder="ชั่วโมง OT"
-                                                    min="0.5" step="0.5"
-                                                />
-                                            </div>
-
-                                            {/* Edit Actions */}
-                                            <div className='flex space-x-2 flex-shrink-0 w-full sm:w-auto justify-end'>
-                                                <button
-                                                    onClick={handleSaveEdit}
-                                                    className="px-3 py-1 bg-emerald-600 text-white font-semibold rounded-lg hover:bg-emerald-700 transition duration-150 shadow-sm flex items-center text-sm"
-                                                    title="บันทึกการแก้ไข"
-                                                >
-                                                    <SaveIcon className="w-4 h-4 mr-1" /> บันทึก
-                                                </button>
-                                                <button
-                                                    onClick={handleCancelEdit}
-                                                    className="px-3 py-1 bg-gray-400 text-white font-semibold rounded-lg hover:bg-gray-500 transition duration-150 shadow-sm flex items-center text-sm"
-                                                    title="ยกเลิก"
-                                                >
-                                                    <XIcon className="w-4 h-4 mr-1" /> ยกเลิก
-                                                </button>
-                                            </div>
-                                        </div>
-                                    );
-                                }
-
-                                return (
-                                    <div key={record.id} className="flex justify-between items-center p-3 bg-white dark:bg-gray-800 rounded-lg shadow-sm border border-gray-100 dark:border-gray-700 hover:shadow-md transition">
-                                        <div className='flex flex-col sm:flex-row sm:items-center'>
-                                            <span className={`font-semibold w-36 text-sm flex-shrink-0 ${isSunday ? 'text-orange-500 dark:text-orange-400' : 'text-gray-800 dark:text-gray-200'}`}>
-                                                {dateToThai(record.date)}
-                                            </span>
-                                            <span className="text-xs text-gray-600 dark:text-gray-400 sm:ml-4">
-                                                <span className="font-mono text-rose-600 dark:text-rose-400 font-bold">{record.otHours}</span> ชม. 
-                                                (<span className={`font-bold ${isSunday ? 'text-orange-600 dark:text-orange-400' : 'text-sky-600 dark:text-sky-400'}`}>
-                                                    @{record.payMultiplier.toFixed(1)}x
-                                                </span>) | 
-                                                รายได้ประมาณ: <span className="font-mono text-emerald-600 dark:text-emerald-400 font-bold">{formatMoney(record.otPay)}</span> บาท
-                                            </span>
-                                        </div>
-                                        <div className='flex space-x-2 flex-shrink-0'>
-                                            <button
-                                                onClick={() => handleStartEdit(record)}
-                                                className="p-1.5 rounded-full text-sky-500 hover:text-sky-700 dark:text-sky-400 dark:hover:text-sky-300 transition hover:bg-gray-100 dark:hover:bg-gray-700"
-                                                title="แก้ไขรายการ"
-                                                disabled={!!editingRecordId} // Disable if another record is being edited
-                                            >
-                                                <EditIcon className="w-4 h-4" />
-                                            </button>
-                                            <button
-                                                onClick={() => handleDeleteRecord(record.id)}
-                                                className="p-1.5 rounded-full text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300 transition hover:bg-gray-100 dark:hover:bg-gray-700"
-                                                title="ลบรายการ"
-                                                disabled={!!editingRecordId}
-                                            >
-                                                <TrashIcon className="w-4 h-4" />
-                                            </button>
-                                        </div>
-                                    </div>
-                                );
-                            })
-                        )}
-                    </div>
-                </div>
-            </div>
-        );
-    };
-
-    const DashboardPage = () => {
-        const { baseSalary, otRate, totalOtHours, totalEffectiveOtHours, totalOtPay, weeklySummary, period1Pay, period2Pay, currentMonth22nd, nextMonth7th } = calculationData;
-        const totalMonthlyEarnings = baseSalary + totalOtPay;
-        
-        // ใช้เดือนที่ถูกเลือกมาแสดงใน Dashboard
-        const selectedMonthName = new Date(selectedMonthYear + '-01').toLocaleDateString('th-TH', { month: 'long', year: 'numeric' });
-
-        return (
-            <div className="p-4 md:p-8 space-y-8 max-w-4xl mx-auto">
-                <h2 className="text-2xl font-extrabold text-sky-700 dark:text-sky-400 text-center mb-6">สรุป Dashboard รายได้ ({selectedMonthName})</h2>
-
-                {/* --- MONTH SELECTOR FOR DASHBOARD --- */}
-                <div className="flex justify-center mb-6 p-4 bg-white dark:bg-gray-800 rounded-xl shadow-lg border border-gray-200 dark:border-gray-700">
-                    <label htmlFor="dashboardMonthFilter" className="text-base font-medium text-gray-700 dark:text-gray-300 mr-4 self-center flex-shrink-0">
-                        เลือกเดือนที่ต้องการดู:
-                    </label>
-                    <select
-                        id="dashboardMonthFilter"
-                        value={selectedMonthYear}
-                        onChange={(e) => setSelectedMonthYear(e.target.value)}
-                        className="block w-full max-w-xs rounded-lg border-2 border-gray-300 dark:border-gray-600 p-2.5 text-base shadow-sm focus:border-sky-500 focus:ring-sky-500 transition bg-white dark:bg-gray-700 dark:text-gray-100"
-                    >
-                        {uniqueMonths.length > 0 ? (
-                            uniqueMonths.map(monthYear => (
-                                <option key={monthYear} value={monthYear}>
-                                    {new Date(monthYear + '-01').toLocaleDateString('th-TH', { month: 'long', year: 'numeric' })}
-                                </option>
-                            ))
-                        ) : (
-                            // แสดงเดือนปัจจุบันหากไม่มีข้อมูล OT เลย
-                            <option value={new Date().toISOString().substring(0, 7)}>
-                                {new Date().toLocaleDateString('th-TH', { month: 'long', year: 'numeric' })} (ไม่มีข้อมูล OT)
-                            </option>
-                        )}
-                    </select>
-                </div>
-                {/* ------------------------------------ */}
-
-                {/* Summary Cards */}
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                    <Card title="เงินเดือนพื้นฐาน" value={formatMoney(baseSalary)} unit="บาท" color="bg-sky-500" icon={<WalletIcon className="w-5 h-5" />} />
-                    <Card title="ชั่วโมง OT (จริง)" value={totalOtHours.toFixed(1)} unit={`ชม. (ค่าเท่ากับ ${totalEffectiveOtHours.toFixed(1)} ชม. ที่ 1.5x)`} color="bg-rose-500" icon={<ClockIcon className="w-5 h-5" />} />
-                    <Card title="รายได้ OT รวม" value={formatMoney(totalOtPay)} unit="บาท" color="bg-emerald-500" icon={<TrendingUpIcon className="w-5 h-5" />} />
-                </div>
-                
-                {/* Total Estimate */}
-                <div className="p-5 bg-sky-50 dark:bg-sky-900 rounded-xl border-4 border-sky-300 dark:border-sky-600 shadow-xl text-center">
-                    <h3 className="text-lg font-bold text-sky-800 dark:text-sky-300">ประมาณการรายได้รวมสุทธิในเดือนที่เลือก</h3>
-                    <p className="text-4xl font-extrabold text-sky-700 dark:text-sky-400 my-2">{formatMoney(totalMonthlyEarnings)}</p>
-                    <p className="text-xs text-gray-600 dark:text-gray-400">เงินเดือน + ค่า OT รวมทั้งเดือน</p>
-                    <p className="text-xs text-gray-600 dark:text-gray-400 mt-2">อัตรา OT ต่อชั่วโมง (1.5x): <span className="font-semibold text-rose-600 dark:text-rose-400">{formatMoney(otRate)}</span> บาท</p>
-                </div>
-
-                {/* --- GEMINI FEATURE SECTION: Negotiation Assistant & OT Advice --- */}
-                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    ${totalSummary}
+                    ${baseSalary > 0 ? payPeriods : `<p class="text-red-500 dark:text-red-400 mt-4 text-center p-4 border rounded-xl border-red-300 dark:border-red-700">**กรุณากรอกเงินเดือนพื้นฐานในหน้า "กรอกข้อมูล" เพื่อดูสรุปรายได้**</p>`}
                     
-                    {/* Negotiation Assistant */}
-                    <div className="bg-white dark:bg-gray-800 p-6 rounded-xl shadow-lg border border-purple-100 dark:border-purple-800">
-                        <h3 className="text-lg font-bold mb-3 text-purple-700 dark:text-purple-400 flex items-center">
-                            <NegotiationIcon className="w-6 h-6 mr-2 text-purple-600 dark:text-purple-400" />
-                            ✨ ผู้ช่วยเจรจาเงินเดือน
-                        </h3>
-                        <p className="text-sm text-gray-600 dark:text-gray-300 mb-4">
-                            สร้างสคริปต์ขอขึ้นเงินเดือน โดยใช้ข้อมูลภาระงานของคุณในเดือนที่เลือก
-                        </p>
-                        <button
-                            onClick={handleGenerateNegotiationScript}
-                            disabled={isScriptLoading || baseSalary <= 0 || totalOtPay <= 0}
-                            className="w-full px-5 py-2.5 bg-purple-600 text-white font-bold rounded-lg hover:bg-purple-700 transition duration-150 shadow-md flex items-center justify-center text-sm disabled:opacity-50 disabled:cursor-not-allowed"
-                        >
-                            {isScriptLoading ? (
-                                <>
-                                    <svg className="animate-spin -ml-1 mr-3 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                                    </svg>
-                                    กำลังร่างสคริปต์...
-                                </>
-                            ) : (
-                                <>
-                                    <span role="img" aria-label="sparkle" className="mr-2">✨</span>
-                                    ร่างสคริปต์เจรจาเงินเดือน
-                                </>
-                            )}
-                        </button>
-
-                        {negotiationScript && (
-                            <div className="mt-4 p-4 bg-purple-50 dark:bg-gray-900 border border-purple-300 dark:border-purple-700 rounded-lg whitespace-pre-wrap text-gray-800 dark:text-gray-200 text-sm">
-                                <h4 className="font-bold mb-2 text-purple-600 dark:text-purple-400">ฉบับร่างสำหรับการเจรจา:</h4>
-                                {negotiationScript}
-                            </div>
-                        )}
-                        {(baseSalary <= 0 || totalOtPay <= 0) && <p className="mt-3 text-xs text-red-500">กรุณากรอกเงินเดือนพื้นฐาน และบันทึกชั่วโมง OT ในเดือนที่เลือกก่อน</p>}
+                    <h3 class="text-xl font-bold text-sky-700 dark:text-sky-400 mt-6 mb-3 flex items-center">${CalendarDaysIcon("w-6 h-6 mr-2")} สรุปรายสัปดาห์</h3>
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                        ${weeklyCards || `<p class="text-gray-500 dark:text-gray-400 md:col-span-3 text-center p-4 border rounded-xl border-gray-300 dark:border-gray-700">ไม่มีข้อมูลโอทีสำหรับเดือนนี้</p>`}
                     </div>
 
-                    {/* Smart OT Advice */}
-                    <div className="bg-white dark:bg-gray-800 p-6 rounded-xl shadow-lg border border-lime-100 dark:border-lime-800">
-                        <h3 className="text-lg font-bold mb-3 text-lime-700 dark:text-lime-400 flex items-center">
-                            <LightbulbIcon className="w-6 h-6 mr-2 text-lime-600 dark:text-lime-400" />
-                            ✨ คำแนะนำการใช้ OT อย่างชาญฉลาด
-                        </h3>
-                        <p className="text-sm text-gray-600 dark:text-gray-300 mb-4">
-                            วิเคราะห์ชั่วโมง OT ในเดือนที่เลือก เพื่อรับคำแนะนำด้านการเพิ่มผลตอบแทน หรือสมดุลชีวิตการทำงาน
-                        </p>
-                        <button
-                            onClick={handleGenerateOtAdvice}
-                            disabled={isAdviceLoading || totalOtPay <= 0}
-                            className="w-full px-5 py-2.5 bg-lime-600 text-white font-bold rounded-lg hover:bg-lime-700 transition duration-150 shadow-md flex items-center justify-center text-sm disabled:opacity-50 disabled:cursor-not-allowed"
-                        >
-                            {isAdviceLoading ? (
-                                <>
-                                    <svg className="animate-spin -ml-1 mr-3 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                                    </svg>
-                                    กำลังวิเคราะห์...
-                                </>
-                            ) : (
-                                <>
-                                    <span role="img" aria-label="sparkle" className="mr-2">✨</span>
-                                    รับคำแนะนำ OT
-                                </>
-                            )}
-                        </button>
+                    ${llmFeatures}
+                </div>
+            `;
 
-                        {otAdvice && (
-                            <div className="mt-4 p-4 bg-lime-50 dark:bg-gray-900 border border-lime-300 dark:border-lime-700 rounded-lg whitespace-pre-wrap text-gray-800 dark:text-gray-200 text-sm">
-                                <h4 className="font-bold mb-2 text-lime-600 dark:text-lime-400">คำแนะนำสำหรับคุณ:</h4>
-                                {otAdvice}
-                            </div>
-                        )}
-                        {totalOtPay <= 0 && <p className="mt-3 text-xs text-red-500">กรุณาบันทึกชั่วโมง OT ในเดือนที่เลือกก่อน</p>}
+            const pageEl = document.getElementById('page-content');
+            pageEl.innerHTML = content;
+
+            // Attach Event Listeners
+            document.getElementById('month-selector-dashboard').addEventListener('change', (e) => {
+                setState({ selectedMonthYear: e.target.value, negotiationScript: '', otAdvice: '' }); // Clear LLM results on month change
+            });
+            document.getElementById('generate-script').addEventListener('click', handleGenerateNegotiationScript);
+            document.getElementById('generate-advice').addEventListener('click', handleGenerateOtAdvice);
+        };
+
+        const renderFooter = () => {
+            const footerEl = document.getElementById('app-footer');
+            footerEl.innerHTML = `
+                <div class="text-center text-xs text-gray-500 dark:text-gray-400">
+                    <p>App ID: ${appId}</p>
+                    <p>User ID: ${state.userId || 'กำลังโหลด...'}</p>
+                    <p>*อัตราโอทีวันอาทิตย์ (วันหยุด) คำนวณที่ 3.0 เท่าของอัตราต่อชั่วโมงปกติ (ตามการตีความชั่วโมง 2 เท่า x อัตรา 1.5 เท่า)</p>
+                </div>
+            `;
+        };
+
+        // --- MAIN RENDER FUNCTION ---
+        const renderApp = () => {
+            updateTheme();
+            renderHeader();
+            renderFooter();
+
+            if (state.loading) {
+                document.getElementById('page-content').innerHTML = `
+                    <div class="flex flex-col items-center justify-center h-full min-h-[300px] space-y-4">
+                        ${Spinner('w-12 h-12')}
+                        <p class="text-lg font-semibold text-sky-600 dark:text-sky-400">กำลังเชื่อมต่อฐานข้อมูล...</p>
                     </div>
+                `;
+                return;
+            }
 
-                </div>
-                {/* -------------------------------------------------------------------- */}
+            if (state.page === 'entry') {
+                renderEntryPage();
+            } else if (state.page === 'dashboard') {
+                renderDashboardPage();
+            }
+        };
 
-                {/* Pay Period Breakdown */}
-                <div className="bg-white dark:bg-gray-800 p-6 rounded-xl shadow-lg border border-teal-100 dark:border-teal-800">
-                    <h3 className="text-xl font-bold mb-4 text-teal-700 dark:text-teal-400 flex items-center">
-                        <CalendarDaysIcon className="w-6 h-6 mr-2 text-teal-600 dark:text-teal-400" />
-                        สรุปตามงวดการจ่ายเงิน (เฉพาะค่า OT)
-                    </h3>
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                        <PayPeriodCard 
-                            title="งวดที่ 1 (จ่ายวันที่ 22)" 
-                            date={currentMonth22nd} 
-                            pay={period1Pay} 
-                            description="โอทีที่ทำระหว่างวันที่ 1 - 15 ของเดือนที่เลือก"
-                        />
-                        <PayPeriodCard 
-                            title="งวดที่ 2 (จ่ายวันที่ 7 เดือนถัดไป)" 
-                            date={nextMonth7th} 
-                            pay={period2Pay} 
-                            description="โอทีที่ทำระหว่างวันที่ 16 - สิ้นเดือนที่เลือก"
-                        />
-                    </div>
-                </div>
+        // Initialize the app on window load
+        window.onload = initApp;
 
-                {/* Weekly Breakdown */}
-                <div className="bg-white dark:bg-gray-800 p-6 rounded-xl shadow-lg border border-amber-100 dark:border-amber-800">
-                    <h3 className="text-xl font-bold mb-4 text-amber-700 dark:text-amber-400 flex items-center">
-                        <BarChart3Icon className="w-6 h-6 mr-2 text-amber-600 dark:text-amber-400" />
-                        สรุปรายได้ OT รายสัปดาห์
-                    </h3>
-                    <div className="space-y-3">
-                        {weeklySummary.length === 0 ? (
-                            <p className="text-sm text-gray-500 italic">ไม่มีรายการ OT ในเดือนนี้เพื่อจัดกลุ่มรายสัปดาห์</p>
-                        ) : (
-                            weeklySummary.map((week, index) => (
-                                <div key={week.weekKey} className="flex justify-between items-center p-4 bg-gray-50 dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700 shadow-sm">
-                                    <div>
-                                        <p className="text-base font-bold text-gray-800 dark:text-gray-200">สัปดาห์ที่ {index + 1} ({dateToThai(week.startDate)} - {dateToThai(week.endDate)})</p>
-                                        <p className="text-xs text-gray-600 dark:text-gray-400">
-                                            {week.totalHours.toFixed(1)} ชม. OT (ค่าเท่ากับ {week.totalEffectiveHours.toFixed(1)} ชม. ที่ 1.5x)
-                                        </p>
-                                    </div>
-                                    <div className="text-right">
-                                        <p className="text-3xl font-extrabold text-emerald-600 dark:text-emerald-400">{formatMoney(week.totalPay)}</p>
-                                        <p className="text-xs text-gray-500 dark:text-gray-400">บาท (ค่า OT)</p>
-                                    </div>
-                                </div>
-                            ))
-                        )}
-                    </div>
-                </div>
-            </div>
-        );
-    };
-
-    const Card = ({ title, value, unit, color, icon }) => (
-        <div className={`p-4 rounded-xl shadow-md text-white ${color} flex flex-col justify-between h-full`}>
-            <div className="flex justify-between items-start mb-1">
-                <p className="text-xs opacity-80">{title}</p>
-                {icon}
-            </div>
-            <p className="text-2xl font-extrabold mt-1">{value}</p>
-            <p className="text-sm font-semibold opacity-90">{unit}</p>
-        </div>
-    );
-    
-    const PayPeriodCard = ({ title, date, pay, description }) => (
-        <div className="p-4 bg-teal-50 dark:bg-teal-900 rounded-lg border border-teal-200 dark:border-teal-700 shadow-sm">
-            <h4 className="text-lg font-bold text-teal-700 dark:text-teal-400">{title}</h4>
-            <p className="text-xs text-gray-600 dark:text-gray-400 mb-2">{description}</p>
-            <p className="text-3xl font-extrabold text-teal-600 dark:text-teal-300">{formatMoney(pay)}</p>
-            <p className="text-sm font-semibold text-gray-700 dark:text-gray-300 mt-1">คาดการณ์จ่าย: {date}</p>
-        </div>
-    );
-
-    if (loading) {
-        return (
-            <div className="flex justify-center items-center h-screen bg-gray-50 dark:bg-gray-900">
-                <div className="text-center">
-                    <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-sky-600 dark:border-sky-400 mx-auto"></div>
-                    <p className="mt-4 text-sky-600 dark:text-sky-400 font-semibold">กำลังเริ่มต้นระบบ...</p>
-                </div>
-            </div>
-        );
-    }
-    
-    return (
-        <div 
-            className="min-h-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100"
-            style={{ 
-                fontFamily: `'Sarabun', 'Inter', sans-serif`,
-            }}
-        >
-            {/* โหลดฟอนต์ Sarabun จาก Google Fonts */}
-            <style>
-                {`
-                    @import url('https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;600;700&display=swap');
-                    html {
-                        font-size: 15px;
-                    }
-                    @media (max-width: 767px) {
-                        html {
-                            font-size: 16px; 
-                        }
-                    }
-                `}
-            </style>
-            
-            <Header page={page} setPage={setPage} userId={userId} dataLoading={dataLoading} theme={theme} toggleTheme={toggleTheme} />
-            
-            {error && (
-                <div className="bg-red-100 dark:bg-red-900 border-l-4 border-red-500 text-red-700 dark:text-red-300 p-4 mx-auto max-w-4xl mt-4 rounded shadow" role="alert">
-                    <p className="font-bold">ข้อผิดพลาด:</p>
-                    <p>{error}</p>
-                </div>
-            )}
-            
-            {userId && (
-                <div className="md:hidden text-xs text-center text-gray-500 dark:text-gray-400 bg-gray-100 dark:bg-gray-800 p-2 border-b border-gray-200 dark:border-gray-700">
-                    <span className="font-medium text-sky-500">UID:</span> {userId}
-                </div>
-            )}
-
-            {dataLoading && (
-                <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 bg-black bg-opacity-10 dark:bg-opacity-50 p-4 rounded-lg z-20">
-                    <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-white mx-auto"></div>
-                </div>
-            )}
-
-            {page === 'entry' ? <EntryPage /> : <DashboardPage />}
-
-            <footer className="p-4 text-center text-xs text-gray-400 dark:text-gray-500 mt-8 border-t border-gray-200 dark:border-gray-700">
-                App ID: {appId} | ข้อมูลบันทึกใน Firestore ภายใต้ User ID ของคุณ
-            </footer>
-        </div>
-    );
-};
-
-export default App;
+    </script>
+</body>
+</html>
